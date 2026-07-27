@@ -202,7 +202,7 @@ namespace NuoMiDesktopPet
         private static readonly StreamGeometry BongoMouseBodyGeometry = CreateBongoMouseBodyGeometry();
         private static readonly StreamGeometry BongoMouseLeftButtonGeometry = CreateBongoMouseButtonGeometry(false);
         private static readonly StreamGeometry BongoMouseRightButtonGeometry = CreateBongoMouseButtonGeometry(true);
-        private static readonly RotateTransform BongoMouseFacingCatTransform =
+        private static readonly RotateTransform BongoMouseUserOrientationTransform =
             CreateFrozenRotateTransform(180.0, 36.0, 226.0);
         private static readonly DrawingGroup BongoSurfaceDrawing = CreateBongoSurfaceDrawing();
         private static readonly DrawingGroup BongoDeskDrawing = CreateBongoDeskDrawing();
@@ -1130,11 +1130,9 @@ namespace NuoMiDesktopPet
             DrawingGroup group = new DrawingGroup();
             using (DrawingContext dc = group.Open())
             {
-                dc.DrawEllipse(ShadowBrush, null, new Point(36, 254), 25, 3);
-
-                // The cable exits the front of the mouse toward the viewer.
-                // That is the correct away-from-the-cat direction when the
-                // cat sits behind the desk.
+                // The cat is the user: its palm rests on the rear of the mouse
+                // (screen top), while the buttons, wheel and front cable point
+                // away from the cat toward the viewer (screen bottom).
                 StreamGeometry cable = new StreamGeometry();
                 using (StreamGeometryContext context = cable.Open())
                 {
@@ -1148,8 +1146,8 @@ namespace NuoMiDesktopPet
                 }
                 cable.Freeze();
                 dc.DrawGeometry(null, BongoMouseDetailPen, cable);
-
-                dc.PushTransform(BongoMouseFacingCatTransform);
+                dc.DrawEllipse(ShadowBrush, null, new Point(36, 254), 25, 3);
+                dc.PushTransform(BongoMouseUserOrientationTransform);
                 dc.DrawGeometry(BongoMouseBrush, null, BongoMouseBodyGeometry);
                 dc.DrawGeometry(
                     BongoMouseButtonBrush,
@@ -2458,7 +2456,8 @@ namespace NuoMiDesktopPet
                 "• 右键可以喂食、玩毛线球或放杯子\n" +
                 "• 糯米会自主观察、扑鼠标、讨食、梳毛和睡觉\n" +
                 "• Bongo 模式会用一只爪操作鼠标，另一只爪准确寻找键位\n" +
-                "• 键盘和鼠标朝向糯米，按键文字从它的方向可读\n" +
+                "• 空格键和鼠标掌心端靠近糯米，线缆与按键前端朝向屏幕下方\n" +
+                "• 键帽文字从糯米方向可读，设备按真实使用姿势摆放\n" +
                 "• 按键和鼠标有落爪、压下、长按、回弹与收势\n" +
                 "• 左右键以小猫面对你的视角显示，避免方向颠倒\n" +
                 "• 停止输入后，它仍会有安静的观察和小动作\n" +
@@ -4678,7 +4677,7 @@ namespace NuoMiDesktopPet
                 _rightMouseAmount,
                 _interactionMotion.RightMouseContact);
 
-            dc.PushTransform(BongoMouseFacingCatTransform);
+            dc.PushTransform(BongoMouseUserOrientationTransform);
 
             if (physicalLeftVisual > 0.01)
             {
@@ -4686,8 +4685,6 @@ namespace NuoMiDesktopPet
                     Clamp(physicalLeftVisual, 0.0, 1.0) * 1.25;
                 dc.PushOpacity(
                     Clamp(physicalLeftVisual, 0.0, 1.0) * 0.96);
-                // Local negative Y becomes screen-down after the mouse is
-                // rotated toward the cat.
                 _bongoLeftMouseDepth.Y = -depth;
                 dc.PushTransform(_bongoLeftMouseDepth);
                 dc.DrawGeometry(
