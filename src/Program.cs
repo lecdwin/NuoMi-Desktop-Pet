@@ -31,6 +31,11 @@ namespace NuoMiDesktopPet
         [STAThread]
         private static void Main(string[] args)
         {
+            // A tiny per-pixel transparent desktop window is inexpensive to
+            // render in software, and this avoids intermittent lost surfaces
+            // on remote, virtual and mixed-refresh display drivers.
+            RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
+
             bool isFirstInstance;
             _singleInstanceMutex = new Mutex(true, "NuoMiDesktopPet.SingleInstance.89AE3DA0", out isFirstInstance);
             if (!isFirstInstance)
@@ -197,6 +202,8 @@ namespace NuoMiDesktopPet
         private static readonly StreamGeometry BongoMouseBodyGeometry = CreateBongoMouseBodyGeometry();
         private static readonly StreamGeometry BongoMouseLeftButtonGeometry = CreateBongoMouseButtonGeometry(false);
         private static readonly StreamGeometry BongoMouseRightButtonGeometry = CreateBongoMouseButtonGeometry(true);
+        private static readonly RotateTransform BongoMouseFacingCatTransform =
+            CreateFrozenRotateTransform(180.0, 36.0, 226.0);
         private static readonly DrawingGroup BongoSurfaceDrawing = CreateBongoSurfaceDrawing();
         private static readonly DrawingGroup BongoDeskDrawing = CreateBongoDeskDrawing();
 
@@ -232,6 +239,15 @@ namespace NuoMiDesktopPet
         private readonly TranslateTransform _rightLegTranslate = new TranslateTransform();
         private readonly RotateTransform _rightLegRotate = new RotateTransform(0, 126, 162);
         private readonly ScaleTransform _rightLegScale = new ScaleTransform(1, 1, 126, 226);
+        private readonly ScaleTransform _windowScale = new ScaleTransform();
+        private readonly TranslateTransform[] _bongoKeyDepthTransforms =
+            CreateBongoKeyDepthTransforms();
+        private readonly TranslateTransform _bongoLeftMouseDepth =
+            new TranslateTransform();
+        private readonly TranslateTransform _bongoRightMouseDepth =
+            new TranslateTransform();
+        private readonly TranslateTransform _bongoWheelTranslate =
+            new TranslateTransform();
         private readonly TranslateTransform[] _floatingHeartTransforms =
         {
             new TranslateTransform(),
@@ -377,7 +393,7 @@ namespace NuoMiDesktopPet
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
             AllowsTransparency = true;
-            Background = null;
+            Background = WpfBrushes.Transparent;
             ShowInTaskbar = false;
             Topmost = true;
             Focusable = true;
@@ -532,8 +548,29 @@ namespace NuoMiDesktopPet
                         TimeSpan.FromMilliseconds(210);
                     break;
 
-                default:
+                case 10:
                     CaptureCurrentFrame("refined-recovered.png");
+                    _blinkAmount = 0.5;
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(80);
+                    break;
+
+                case 11:
+                    CaptureCurrentFrame("refined-blink-mid.png");
+                    _blinkAmount = 1.0;
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(80);
+                    break;
+
+                case 12:
+                    CaptureCurrentFrame("refined-blink-closed.png");
+                    _blinkAmount = 0.0;
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(80);
+                    break;
+
+                default:
+                    CaptureCurrentFrame("refined-blink-recovered.png");
                     _diagnosticTimer.Stop();
                     _diagnosticTimer.Tick -= DiagnosticPreviewTick;
                     _diagnosticTimer = null;
@@ -917,6 +954,7 @@ namespace NuoMiDesktopPet
             double fontSize,
             params int[] virtualKeys)
         {
+            bounds = FaceKeyboardBoundsTowardCat(bounds);
             BongoKeyCap key = new BongoKeyCap();
             key.Bounds = bounds;
             key.Label = label;
@@ -934,6 +972,17 @@ namespace NuoMiDesktopPet
             keys.Add(key);
         }
 
+        private static Rect FaceKeyboardBoundsTowardCat(Rect bounds)
+        {
+            const double centerX = 140.0;
+            const double centerY = 226.0;
+            return new Rect(
+                centerX * 2.0 - bounds.Right,
+                centerY * 2.0 - bounds.Bottom,
+                bounds.Width,
+                bounds.Height);
+        }
+
         private static DrawingGroup CreateBongoKeyLabel(
             string label,
             Rect bounds,
@@ -943,6 +992,11 @@ namespace NuoMiDesktopPet
             DrawingGroup group = new DrawingGroup();
             using (DrawingContext dc = group.Open())
             {
+                RotateTransform faceCat = CreateFrozenRotateTransform(
+                    180.0,
+                    bounds.X + bounds.Width * 0.5,
+                    bounds.Y + bounds.Height * 0.5);
+                dc.PushTransform(faceCat);
                 FormattedText text = new FormattedText(
                     label,
                     CultureInfo.InvariantCulture,
@@ -959,6 +1013,7 @@ namespace NuoMiDesktopPet
                         bounds.Y +
                         (bounds.Height - text.Height) * 0.5 -
                         0.15));
+                dc.Pop();
             }
             group.Freeze();
             return group;
@@ -1075,20 +1130,26 @@ namespace NuoMiDesktopPet
             DrawingGroup group = new DrawingGroup();
             using (DrawingContext dc = group.Open())
             {
+                dc.DrawEllipse(ShadowBrush, null, new Point(36, 254), 25, 3);
+
+                // The cable exits the front of the mouse toward the viewer.
+                // That is the correct away-from-the-cat direction when the
+                // cat sits behind the desk.
                 StreamGeometry cable = new StreamGeometry();
                 using (StreamGeometryContext context = cable.Open())
                 {
-                    context.BeginFigure(new Point(36, 198), false, false);
+                    context.BeginFigure(new Point(36, 253), false, false);
                     context.BezierTo(
-                        new Point(36, 193),
-                        new Point(31, 191),
-                        new Point(33, 187),
+                        new Point(36, 256),
+                        new Point(31, 257),
+                        new Point(33, 259),
                         true,
                         false);
                 }
                 cable.Freeze();
                 dc.DrawGeometry(null, BongoMouseDetailPen, cable);
-                dc.DrawEllipse(ShadowBrush, null, new Point(36, 254), 25, 3);
+
+                dc.PushTransform(BongoMouseFacingCatTransform);
                 dc.DrawGeometry(BongoMouseBrush, null, BongoMouseBodyGeometry);
                 dc.DrawGeometry(
                     BongoMouseButtonBrush,
@@ -1137,6 +1198,7 @@ namespace NuoMiDesktopPet
                     new Point(36, 247),
                     1.15,
                     1.15);
+                dc.Pop();
 
                 dc.DrawRoundedRectangle(
                     BongoKeyboardBrush,
@@ -1159,6 +1221,28 @@ namespace NuoMiDesktopPet
             }
             group.Freeze();
             return group;
+        }
+
+        private static RotateTransform CreateFrozenRotateTransform(
+            double angle,
+            double centerX,
+            double centerY)
+        {
+            RotateTransform transform =
+                new RotateTransform(angle, centerX, centerY);
+            transform.Freeze();
+            return transform;
+        }
+
+        private static TranslateTransform[] CreateBongoKeyDepthTransforms()
+        {
+            TranslateTransform[] transforms =
+                new TranslateTransform[BongoKeyCaps.Length];
+            for (int index = 0; index < transforms.Length; index++)
+            {
+                transforms[index] = new TranslateTransform();
+            }
+            return transforms;
         }
 
         private static Pen MakePen(WpfBrush brush, double thickness)
@@ -2374,6 +2458,7 @@ namespace NuoMiDesktopPet
                 "• 右键可以喂食、玩毛线球或放杯子\n" +
                 "• 糯米会自主观察、扑鼠标、讨食、梳毛和睡觉\n" +
                 "• Bongo 模式会用一只爪操作鼠标，另一只爪准确寻找键位\n" +
+                "• 键盘和鼠标朝向糯米，按键文字从它的方向可读\n" +
                 "• 按键和鼠标有落爪、压下、长按、回弹与收势\n" +
                 "• 左右键以小猫面对你的视角显示，避免方向颠倒\n" +
                 "• 停止输入后，它仍会有安静的观察和小动作\n" +
@@ -3310,16 +3395,19 @@ namespace NuoMiDesktopPet
                     safeWorkArea.Top,
                     Math.Max(safeWorkArea.Top, safeWorkArea.Bottom - height));
 
-                SetWindowPos(
-                    windowHandle,
-                    IntPtr.Zero,
-                    renderLeft,
-                    renderTop,
-                    0,
-                    0,
-                    SetWindowPosNoSize |
-                    SetWindowPosNoZOrder |
-                    SetWindowPosNoActivate);
+                if (renderLeft != rect.Left || renderTop != rect.Top)
+                {
+                    SetWindowPos(
+                        windowHandle,
+                        IntPtr.Zero,
+                        renderLeft,
+                        renderTop,
+                        0,
+                        0,
+                        SetWindowPosNoSize |
+                        SetWindowPosNoZOrder |
+                        SetWindowPosNoActivate);
+                }
             }
         }
 
@@ -4327,7 +4415,9 @@ namespace NuoMiDesktopPet
 
             double scaleX = ActualWidth / BaseWidth;
             double scaleY = ActualHeight / BaseHeight;
-            drawingContext.PushTransform(new ScaleTransform(scaleX, scaleY));
+            _windowScale.ScaleX = scaleX;
+            _windowScale.ScaleY = scaleY;
+            drawingContext.PushTransform(_windowScale);
 
             double seconds = _clock.Elapsed.TotalSeconds;
             long now = _clock.ElapsedMilliseconds;
@@ -4440,12 +4530,10 @@ namespace NuoMiDesktopPet
             dc.PushTransform(_headScale);
 
             Rect headRect = new Rect(22, 4, 176, 162);
-            if (_blinkAmount < 0.995)
-            {
-                dc.PushOpacity(1.0 - _blinkAmount);
-                dc.DrawImage(_rigHead, headRect);
-                dc.Pop();
-            }
+            // Keep one fully opaque head underneath the blink overlay. A
+            // traditional two-layer cross-fade briefly reduces combined alpha
+            // on a transparent window and looks like the whole pet flickers.
+            dc.DrawImage(_rigHead, headRect);
             if (_blinkAmount > 0.005)
             {
                 dc.PushOpacity(_blinkAmount);
@@ -4568,7 +4656,10 @@ namespace NuoMiDesktopPet
                         Math.Max(0.0, key.Bounds.Height - 0.55)),
                     1.6,
                     1.6);
-                dc.PushTransform(new TranslateTransform(0.0, depth));
+                TranslateTransform keyDepth =
+                    _bongoKeyDepthTransforms[index];
+                keyDepth.Y = depth;
+                dc.PushTransform(keyDepth);
                 dc.DrawRoundedRectangle(
                     BongoLeftActiveBrush,
                     BongoKeyPen,
@@ -4587,21 +4678,26 @@ namespace NuoMiDesktopPet
                 _rightMouseAmount,
                 _interactionMotion.RightMouseContact);
 
+            dc.PushTransform(BongoMouseFacingCatTransform);
+
             if (physicalLeftVisual > 0.01)
             {
                 double depth =
                     Clamp(physicalLeftVisual, 0.0, 1.0) * 1.25;
                 dc.PushOpacity(
                     Clamp(physicalLeftVisual, 0.0, 1.0) * 0.96);
-                dc.PushTransform(new TranslateTransform(0.0, depth));
+                // Local negative Y becomes screen-down after the mouse is
+                // rotated toward the cat.
+                _bongoLeftMouseDepth.Y = -depth;
+                dc.PushTransform(_bongoLeftMouseDepth);
                 dc.DrawGeometry(
                     BongoLeftActiveBrush,
                     null,
-                    BongoMouseRightButtonGeometry);
+                    BongoMouseLeftButtonGeometry);
                 dc.DrawGeometry(
                     null,
                     BongoMouseDetailPen,
-                    BongoMouseRightButtonGeometry);
+                    BongoMouseLeftButtonGeometry);
                 dc.Pop();
                 dc.Pop();
                 dc.PushOpacity(
@@ -4609,7 +4705,7 @@ namespace NuoMiDesktopPet
                 dc.DrawEllipse(
                     BongoLeftActiveBrush,
                     null,
-                    new Point(49.0, 219.2),
+                    new Point(23.0, 219.2),
                     3.1,
                     1.25);
                 dc.Pop();
@@ -4621,15 +4717,16 @@ namespace NuoMiDesktopPet
                     Clamp(physicalRightVisual, 0.0, 1.0) * 1.25;
                 dc.PushOpacity(
                     Clamp(physicalRightVisual, 0.0, 1.0) * 0.96);
-                dc.PushTransform(new TranslateTransform(0.0, depth));
+                _bongoRightMouseDepth.Y = -depth;
+                dc.PushTransform(_bongoRightMouseDepth);
                 dc.DrawGeometry(
                     BongoRightActiveBrush,
                     null,
-                    BongoMouseLeftButtonGeometry);
+                    BongoMouseRightButtonGeometry);
                 dc.DrawGeometry(
                     null,
                     BongoMouseDetailPen,
-                    BongoMouseLeftButtonGeometry);
+                    BongoMouseRightButtonGeometry);
                 dc.Pop();
                 dc.Pop();
                 dc.PushOpacity(
@@ -4637,7 +4734,7 @@ namespace NuoMiDesktopPet
                 dc.DrawEllipse(
                     BongoRightActiveBrush,
                     null,
-                    new Point(23.0, 219.2),
+                    new Point(49.0, 219.2),
                     3.1,
                     1.25);
                 dc.Pop();
@@ -4656,7 +4753,8 @@ namespace NuoMiDesktopPet
                 5);
             double wheelOffset =
                 _interactionMotion.WheelMotion * 1.4;
-            dc.PushTransform(new TranslateTransform(0.0, wheelOffset));
+            _bongoWheelTranslate.Y = wheelOffset;
+            dc.PushTransform(_bongoWheelTranslate);
             dc.DrawRoundedRectangle(
                 _wheelAmount > 0.01
                     ? BongoWheelActiveBrush
@@ -4668,6 +4766,7 @@ namespace NuoMiDesktopPet
             dc.DrawLine(BongoMouseDetailPen, new Point(34, 208), new Point(38, 208));
             dc.DrawLine(BongoMouseDetailPen, new Point(34, 211), new Point(38, 211));
             dc.DrawLine(BongoMouseDetailPen, new Point(34, 214), new Point(38, 214));
+            dc.Pop();
             dc.Pop();
 
             if (_interactionMotion.Engagement > 0.04)
@@ -5248,14 +5347,20 @@ namespace NuoMiDesktopPet
                 workArea.Top,
                 Math.Max(workArea.Top, workArea.Bottom - windowHeight));
 
-            SetWindowPos(
-                windowHandle,
-                IntPtr.Zero,
-                proposedLeft,
-                proposedTop,
-                0,
-                0,
-                SetWindowPosNoSize | SetWindowPosNoZOrder | SetWindowPosNoActivate);
+            if (proposedLeft != currentRect.Left ||
+                proposedTop != currentRect.Top)
+            {
+                SetWindowPos(
+                    windowHandle,
+                    IntPtr.Zero,
+                    proposedLeft,
+                    proposedTop,
+                    0,
+                    0,
+                    SetWindowPosNoSize |
+                    SetWindowPosNoZOrder |
+                    SetWindowPosNoActivate);
+            }
             e.Handled = true;
         }
 
