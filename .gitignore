@@ -1,0 +1,26 @@
+# 编译产物：正式 EXE 通过 GitHub Releases 提供
+/dist/
+/obj/
+
+# 只保留一张 README 预览图
+/artifacts/*
+!/artifacts/refined-idle.png
+
+# 未使用的素材草稿和色键中间图
+/assets/black-kitten-*.png
+/assets/*-chroma.png
+
+# 编辑器和系统文件
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 临时文件
+*.tmp
+*.log
+*.bak
+~$*
