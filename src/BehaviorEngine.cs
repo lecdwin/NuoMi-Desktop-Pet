@@ -222,6 +222,10 @@ namespace NuoMiDesktopPet
                 {
                     return false;
                 }
+                else
+                {
+                    ApplyInterruptedCooldown(Current, now);
+                }
             }
 
             Current = behavior;
@@ -229,7 +233,6 @@ namespace NuoMiDesktopPet
             Until = SafeAdd(now, duration);
             _priority = priority;
             _isRunning = true;
-            RememberBehavior(behavior, now);
             return true;
         }
 
@@ -266,7 +269,9 @@ namespace NuoMiDesktopPet
                 return false;
             }
 
-            ApplyCompletion(Current);
+            CatBehavior completed = Current;
+            ApplyCompletion(completed);
+            RememberBehavior(completed, now);
             ResetAction(now);
             return true;
         }
@@ -281,6 +286,7 @@ namespace NuoMiDesktopPet
                 return false;
             }
 
+            ApplyInterruptedCooldown(Current, now);
             ResetAction(now);
             return true;
         }
@@ -311,6 +317,12 @@ namespace NuoMiDesktopPet
                 cursorSpeed = 0.0;
             }
 
+            CatBehavior urgentBehavior;
+            if (TryChooseUrgent(now, out urgentBehavior))
+            {
+                return urgentBehavior;
+            }
+
             double[] weights = new double[12];
 
             weights[(int)CatBehavior.Idle] = 8.0;
@@ -321,10 +333,12 @@ namespace NuoMiDesktopPet
                 1.5 + Affection * 0.045 + Mood * 0.025;
 
             weights[(int)CatBehavior.Begging] =
-                Hunger < 42.0 ? 0.0 : (Hunger - 42.0) * 0.34;
-            if (Hunger >= 82.0)
+                Hunger < 55.0
+                    ? 0.0
+                    : (Hunger - 55.0) * 0.45;
+            if (Hunger >= 78.0)
             {
-                weights[(int)CatBehavior.Begging] += 28.0;
+                weights[(int)CatBehavior.Begging] += 45.0;
             }
 
             weights[(int)CatBehavior.Sleeping] =
@@ -366,6 +380,35 @@ namespace NuoMiDesktopPet
         }
 
         /// <summary>
+        /// Returns a need-driven action only when its own cooldown permits it.
+        /// This lets the UI interrupt a busy Bongo session for a genuine need
+        /// without accidentally opening the full autonomous lottery.
+        /// </summary>
+        public bool TryChooseUrgent(
+            long now,
+            out CatBehavior behavior)
+        {
+            // A strong need is a promise rather than just another lottery
+            // ticket. Cooldown still prevents repeated begging every few
+            // seconds after the owner has already seen the request.
+            if (Hunger >= 82.0 &&
+                now >= _cooldownUntil[(int)CatBehavior.Begging])
+            {
+                behavior = CatBehavior.Begging;
+                return true;
+            }
+            if (Energy <= 16.0 &&
+                now >= _cooldownUntil[(int)CatBehavior.Sleeping])
+            {
+                behavior = CatBehavior.Sleeping;
+                return true;
+            }
+
+            behavior = CatBehavior.Idle;
+            return false;
+        }
+
+        /// <summary>
         /// Chooses a small desk-safe action that can coexist with the keyboard
         /// and mouse pose.  It deliberately excludes actions that move the
         /// window, create props or take control of the paws.
@@ -382,14 +425,6 @@ namespace NuoMiDesktopPet
             weights[(int)CatBehavior.Observe] = 27.0;
             weights[(int)CatBehavior.Purring] =
                 2.0 + Affection * 0.035 + Mood * 0.018;
-            weights[(int)CatBehavior.Stretching] =
-                Energy > 25.0
-                    ? 6.0 + Energy * 0.015
-                    : 1.0;
-            weights[(int)CatBehavior.Sleeping] =
-                Energy < 34.0
-                    ? 4.0 + (34.0 - Energy) * 0.42
-                    : 0.0;
             ApplyHistoryAndCooldown(weights, now);
             return PickWeighted(weights);
         }
@@ -601,6 +636,41 @@ namespace NuoMiDesktopPet
             }
         }
 
+        private void ApplyInterruptedCooldown(
+            CatBehavior behavior,
+            long now)
+        {
+            if (behavior == CatBehavior.Idle)
+            {
+                return;
+            }
+
+            int minimum;
+            int maximum;
+            if (behavior == CatBehavior.Begging)
+            {
+                minimum = 90000;
+                maximum = 180000;
+            }
+            else if (behavior == CatBehavior.Sleeping)
+            {
+                minimum = 15000;
+                maximum = 30000;
+            }
+            else
+            {
+                minimum = 3500;
+                maximum = 8000;
+            }
+
+            int delay =
+                minimum + _random.Next(maximum - minimum + 1);
+            int index = (int)behavior;
+            _cooldownUntil[index] = Math.Max(
+                _cooldownUntil[index],
+                SafeAdd(now, delay));
+        }
+
         private static void GetCooldownRange(
             CatBehavior behavior,
             out int minimum,
@@ -621,8 +691,8 @@ namespace NuoMiDesktopPet
                     maximum = 180000;
                     break;
                 case CatBehavior.Begging:
-                    minimum = 20000;
-                    maximum = 45000;
+                    minimum = 180000;
+                    maximum = 360000;
                     break;
                 case CatBehavior.Eating:
                     minimum = 30000;

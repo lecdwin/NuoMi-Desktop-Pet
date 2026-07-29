@@ -33,6 +33,8 @@ namespace NuoMiDesktopPet
         private long _lastWheelAt = -10000L;
         private long _lastInputAt = -10000L;
         private long _lastDistinctKeyAt = -10000L;
+        private long _lastTailImpulseAt = -10000L;
+        private long _lastTailTouchAt = -10000L;
         private int _lastVirtualKey = -1;
         private int _wheelDirection;
 
@@ -179,9 +181,18 @@ namespace NuoMiDesktopPet
                 (isRepeat ? 0.30 : (rapid ? 0.48 : 0.72)) * scale;
             _headReactionVelocity +=
                 (alternating ? 0.42 : 0.31) * scale;
-            _tailKickVelocity +=
-                (rapid ? 1.08 : 0.72) * scale *
-                (_keyReachTarget >= 0.0 ? 1.0 : -1.0);
+            // Typing controls the paws and engagement continuously. The tail
+            // only acknowledges the beginning of a typing burst; mapping every
+            // individual letter to a left/right tail kick looks like jitter.
+            if ((spacing < 0L || spacing >= 650L) &&
+                now - _lastTailImpulseAt >= 450L)
+            {
+                double direction = Math.Abs(_tailKick) >= 0.018
+                    ? (_tailKick > 0.0 ? -1.0 : 1.0)
+                    : (_random.Next(2) == 0 ? -1.0 : 1.0);
+                _tailKickVelocity += direction * 0.18 * scale;
+                _lastTailImpulseAt = now;
+            }
 
             if (virtualKey != _lastVirtualKey)
             {
@@ -196,12 +207,18 @@ namespace NuoMiDesktopPet
             if (physicalLeft)
             {
                 _lastLeftMouseStrikeAt = now;
-                _tailKickVelocity += 0.58 * scale;
             }
             else
             {
                 _lastRightMouseStrikeAt = now;
-                _tailKickVelocity -= 0.58 * scale;
+            }
+
+            if (now - _lastTailImpulseAt >= 360L)
+            {
+                _tailKickVelocity +=
+                    (physicalLeft ? 0.13 : -0.13) *
+                    scale;
+                _lastTailImpulseAt = now;
             }
 
             _lastInputAt = now;
@@ -277,15 +294,32 @@ namespace NuoMiDesktopPet
             _lastInputAt = now;
             _mouseEnergy = Clamp(_mouseEnergy + 0.18 * scale, 0.0, 1.0);
             _headReactionVelocity += 0.16 * scale * _wheelDirection;
-            _tailKickVelocity -= 0.34 * scale * _wheelDirection;
+            if (now - _lastTailImpulseAt >= 420L)
+            {
+                _tailKickVelocity -=
+                    0.08 *
+                    scale *
+                    _wheelDirection;
+                _lastTailImpulseAt = now;
+            }
         }
 
         public void RegisterTailTouch(long now)
         {
             double scale = PersonalityScale;
-            double direction = _random.Next(2) == 0 ? -1.0 : 1.0;
+            double direction = Math.Abs(_tailKick) >= 0.018
+                ? (_tailKick > 0.0 ? -1.0 : 1.0)
+                : (_random.Next(2) == 0 ? -1.0 : 1.0);
             _lastInputAt = now;
-            _tailKickVelocity += direction * 2.15 * scale;
+            // Touching the tail is a direct interaction and must not be
+            // swallowed just because a key or mouse impulse happened a moment
+            // earlier. Only consecutive tail touches share this debounce.
+            if (now - _lastTailTouchAt >= 240L)
+            {
+                _tailKickVelocity += direction * 0.90 * scale;
+                _lastTailImpulseAt = now;
+                _lastTailTouchAt = now;
+            }
             _bodyReactionVelocity += 0.34 * scale;
             _headReactionVelocity -= direction * 0.82 * scale;
             _engagement = Clamp(_engagement + 0.16, 0.0, 1.0);
@@ -300,10 +334,14 @@ namespace NuoMiDesktopPet
                 (_random.NextDouble() - 0.5) *
                 0.36 *
                 scale;
-            _tailKickVelocity +=
-                (_random.NextDouble() - 0.5) *
-                0.48 *
-                scale;
+            if (now - _lastTailImpulseAt >= 420L)
+            {
+                _tailKickVelocity +=
+                    (_random.NextDouble() - 0.5) *
+                    0.28 *
+                    scale;
+                _lastTailImpulseAt = now;
+            }
             _engagement = Clamp(_engagement + 0.06, 0.0, 1.0);
         }
 
@@ -425,8 +463,8 @@ namespace NuoMiDesktopPet
                     ref _tailKick,
                     ref _tailKickVelocity,
                     0.0,
-                    33.0,
-                    8.8,
+                    10.5,
+                    6.6,
                     dt);
 
                 _typingEnergy *= Math.Exp(-dt * 1.55);
@@ -455,11 +493,11 @@ namespace NuoMiDesktopPet
                 _headReactionVelocity,
                 -1.8 * scale,
                 2.0 * scale);
-            _tailKick = Clamp(_tailKick, -0.16 * scale, 0.16 * scale);
+            _tailKick = Clamp(_tailKick, -0.12 * scale, 0.12 * scale);
             _tailKickVelocity = Clamp(
                 _tailKickVelocity,
-                -2.4 * scale,
-                2.4 * scale);
+                -1.15 * scale,
+                1.15 * scale);
         }
 
         public double GetIdleWeightShift(double seconds)
@@ -504,6 +542,8 @@ namespace NuoMiDesktopPet
             _lastWheelAt = -10000L;
             _lastInputAt = -10000L;
             _lastDistinctKeyAt = -10000L;
+            _lastTailImpulseAt = -10000L;
+            _lastTailTouchAt = -10000L;
             _lastVirtualKey = -1;
             _wheelDirection = 0;
             _keyReachTarget = 0.0;

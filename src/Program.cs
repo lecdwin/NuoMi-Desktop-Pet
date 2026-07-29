@@ -11,6 +11,7 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
 using Drawing = System.Drawing;
@@ -26,7 +27,11 @@ namespace NuoMiDesktopPet
 {
     internal static class Program
     {
+        private const string ShowExistingEventName =
+            "NuoMiDesktopPet.ShowExisting.89AE3DA0";
         private static Mutex _singleInstanceMutex;
+        private static EventWaitHandle _showExistingEvent;
+        private static RegisteredWaitHandle _showExistingWait;
 
         [STAThread]
         private static void Main(string[] args)
@@ -36,34 +41,121 @@ namespace NuoMiDesktopPet
             // on remote, virtual and mixed-refresh display drivers.
             RenderOptions.ProcessRenderMode = RenderMode.SoftwareOnly;
 
+            string diagnosticPreviewDirectory =
+                GetArgumentValue(args, "--diagnostic-preview=");
+            bool diagnosticPreview =
+                !String.IsNullOrEmpty(
+                    diagnosticPreviewDirectory);
+            string mutexName =
+                diagnosticPreview
+                ? "NuoMiDesktopPet.Diagnostic." +
+                    Process.GetCurrentProcess().Id.ToString(
+                        CultureInfo.InvariantCulture)
+                : "NuoMiDesktopPet.SingleInstance.89AE3DA0";
             bool isFirstInstance;
-            _singleInstanceMutex = new Mutex(true, "NuoMiDesktopPet.SingleInstance.89AE3DA0", out isFirstInstance);
+            _singleInstanceMutex = new Mutex(
+                true,
+                mutexName,
+                out isFirstInstance);
             if (!isFirstInstance)
             {
-                System.Windows.MessageBox.Show(
-                    "糯米已经在桌面上或系统托盘里运行啦。",
-                    "糯米桌面宠物",
-                    MessageBoxButton.OK,
-                    MessageBoxImage.Information);
+                bool signaled = false;
+                if (!diagnosticPreview)
+                {
+                    try
+                    {
+                        using (EventWaitHandle showEvent =
+                            EventWaitHandle.OpenExisting(
+                                ShowExistingEventName))
+                        {
+                            signaled = showEvent.Set();
+                        }
+                    }
+                    catch
+                    {
+                        signaled = false;
+                    }
+                }
+
+                if (!signaled)
+                {
+                    System.Windows.MessageBox.Show(
+                        "糯米已经在运行啦。请双击右下角托盘图标把它叫回来。",
+                        "糯米桌面宠物",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                }
                 return;
+            }
+
+            if (!diagnosticPreview)
+            {
+                _showExistingEvent =
+                    new EventWaitHandle(
+                        false,
+                        EventResetMode.AutoReset,
+                        ShowExistingEventName);
             }
 
             WpfApplication app = new WpfApplication();
             app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
-            string diagnosticPreviewDirectory =
-                GetArgumentValue(args, "--diagnostic-preview=");
-            bool diagnosticPreview =
-                !String.IsNullOrEmpty(diagnosticPreviewDirectory);
-            PetWindow pet = new PetWindow(diagnosticPreview);
+            bool startHidden =
+                HasArgument(args, "--hidden");
+            PetWindow pet;
+            try
+            {
+                pet = new PetWindow(
+                    diagnosticPreview,
+                    startHidden && !diagnosticPreview);
+            }
+            catch (Exception ex)
+            {
+                ReportFatalError(ex);
+                DisposeProcessCoordination();
+                return;
+            }
+
+            if (_showExistingEvent != null)
+            {
+                _showExistingWait =
+                    ThreadPool.RegisterWaitForSingleObject(
+                        _showExistingEvent,
+                        delegate
+                        {
+                            if (pet.Dispatcher.HasShutdownStarted)
+                            {
+                                return;
+                            }
+
+                            pet.Dispatcher.BeginInvoke(
+                                (Action)pet.ShowFromExternalRequest);
+                        },
+                        null,
+                        Timeout.Infinite,
+                        false);
+            }
+            app.DispatcherUnhandledException +=
+                delegate(
+                    object sender,
+                    DispatcherUnhandledExceptionEventArgs e)
+                {
+                    ReportFatalError(e.Exception);
+                    e.Handled = true;
+                    try
+                    {
+                        pet.ExitApplication();
+                    }
+                    catch
+                    {
+                        app.Shutdown();
+                    }
+                };
             app.SessionEnding += delegate
             {
                 pet.ExitApplication();
             };
 
-            bool startHidden =
-                HasArgument(args, "--hidden") ||
-                HasArgument(args, "--autostart");
             if (!startHidden || diagnosticPreview)
             {
                 pet.Show();
@@ -76,11 +168,73 @@ namespace NuoMiDesktopPet
 
             app.Run();
 
+            DisposeProcessCoordination();
+        }
+
+        private static void DisposeProcessCoordination()
+        {
+            if (_showExistingWait != null)
+            {
+                _showExistingWait.Unregister(null);
+                _showExistingWait = null;
+            }
+            if (_showExistingEvent != null)
+            {
+                _showExistingEvent.Dispose();
+                _showExistingEvent = null;
+            }
             if (_singleInstanceMutex != null)
             {
                 _singleInstanceMutex.ReleaseMutex();
                 _singleInstanceMutex.Dispose();
+                _singleInstanceMutex = null;
             }
+        }
+
+        private static void ReportFatalError(Exception exception)
+        {
+            string logPath = null;
+            try
+            {
+                string directory =
+                    Path.Combine(
+                        Environment.GetFolderPath(
+                            Environment.SpecialFolder.LocalApplicationData),
+                        "NuoMiDesktopPet",
+                        "logs");
+                Directory.CreateDirectory(directory);
+                logPath =
+                    Path.Combine(
+                        directory,
+                        "latest.log");
+                File.WriteAllText(
+                    logPath,
+                    DateTime.Now.ToString(
+                        "yyyy-MM-dd HH:mm:ss",
+                        CultureInfo.InvariantCulture) +
+                    Environment.NewLine +
+                    (exception == null
+                        ? "Unknown error."
+                        : exception.ToString()));
+            }
+            catch
+            {
+                logPath = null;
+            }
+
+            string message =
+                "糯米遇到问题，需要先休息一下。重新打开程序通常就能恢复。";
+            if (!String.IsNullOrEmpty(logPath))
+            {
+                message +=
+                    "\n\n错误记录已保存在：\n" +
+                    logPath;
+            }
+            System.Windows.MessageBox.Show(
+                message,
+                "糯米桌面宠物",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
         }
 
         private static bool HasArgument(string[] args, string expected)
@@ -123,16 +277,23 @@ namespace NuoMiDesktopPet
             }
             return null;
         }
+
     }
 
     internal sealed class PetWindow : Window
     {
         private const double BaseWidth = 220.0;
         private const double BaseHeight = 260.0;
+        private const int MinimumScalePercentage = 60;
+        private const int MaximumScalePercentage = 150;
         private const string AppName = "糯米桌面宠物";
         private const string StartupValueName = "NuoMiDesktopPet";
         private const string SettingsKeyPath = @"Software\NuoMiDesktopPet";
         private const string StartupKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const int WmMouseActivate = 0x0021;
+        private const int WmNcHitTest = 0x0084;
+        private const int MaNoActivate = 3;
+        private const int HtTransparent = -1;
         private const double TailRootX = 154.0;
         private const double TailRootY = 234.0;
 
@@ -260,8 +421,11 @@ namespace NuoMiDesktopPet
         private WpfMenuItem _followMenuItem;
         private WpfMenuItem _startupMenuItem;
         private WpfMenuItem _topmostMenuItem;
+        private WpfMenuItem _autoHideFullscreenMenuItem;
         private WpfMenuItem _autoInteractionMenuItem;
         private WpfMenuItem _bongoModeMenuItem;
+        private WpfMenuItem _motionPersonalityRootMenuItem;
+        private WpfMenuItem _sizeRootMenuItem;
         private readonly List<WpfMenuItem> _sizeMenuItems = new List<WpfMenuItem>();
         private readonly List<WpfMenuItem> _motionPersonalityMenuItems =
             new List<WpfMenuItem>();
@@ -271,8 +435,12 @@ namespace NuoMiDesktopPet
         private Forms.ToolStripMenuItem _trayFollowItem;
         private Forms.ToolStripMenuItem _trayStartupItem;
         private Forms.ToolStripMenuItem _trayTopmostItem;
+        private Forms.ToolStripMenuItem _trayAutoHideFullscreenItem;
         private Forms.ToolStripMenuItem _trayAutoInteractionItem;
         private Forms.ToolStripMenuItem _trayBongoModeItem;
+        private Forms.ToolStripMenuItem _traySizeRoot;
+        private readonly List<Forms.ToolStripMenuItem> _traySizeItems =
+            new List<Forms.ToolStripMenuItem>();
         private Forms.ToolStripMenuItem _trayMotionPersonalityRoot;
         private readonly List<Forms.ToolStripMenuItem> _trayMotionPersonalityItems =
             new List<Forms.ToolStripMenuItem>();
@@ -283,8 +451,13 @@ namespace NuoMiDesktopPet
         private bool _followMouse = true;
         private bool _autoInteraction = true;
         private bool _bongoMode = true;
+        private bool _autoHideFullscreen = true;
+        private bool _userHidden;
+        private bool _fullscreenSuppressed;
+        private bool _fullscreenBypassUntilExit;
         private bool _hasShownBackgroundTip;
         private bool _hasShownInputMonitorError;
+        private bool _hasShownSettingsSaveError;
         private bool _needsVisibilityCorrection;
         private Drawing.Point _dragStartCursor;
         private NativeRect _dragStartWindowRect;
@@ -294,7 +467,10 @@ namespace NuoMiDesktopPet
         private double _dragLean;
         private double _dragVerticalTarget;
         private double _dragVertical;
-        private double _userScale = 1.0;
+        private double _userScale = 0.80;
+        private double _breathPhase;
+        private double _tailSwayPhase = 0.3;
+        private double _tailEngagementEnvelope;
         private double _headAngle;
         private double _headShiftX;
         private double _headShiftY;
@@ -329,10 +505,15 @@ namespace NuoMiDesktopPet
         private bool _poseRecoveryActive;
         private long _poseRecoveryStartedAt;
         private long _poseRecoveryUntil;
+        private long _tailRecoveryUntil;
         private PetPose _poseRecoveryDelta;
+        private long _behaviorInputConflictStartedAt = -1L;
         private bool _hasAutoWindowPosition;
         private double _autoWindowX;
         private double _autoWindowY;
+        private bool _hasBehaviorHomePosition;
+        private double _behaviorHomeX;
+        private double _behaviorHomeY;
         private PropWindow _activeProp;
         private int _propOriginX;
         private int _propOriginY;
@@ -341,6 +522,8 @@ namespace NuoMiDesktopPet
         private int _propMaximumX;
         private int _propMinimumY;
         private int _propMaximumY;
+        private double _propPixelScaleX = 1.0;
+        private double _propPixelScaleY = 1.0;
         private long _lastPropTouchAt = -10000L;
         private double _propTouchStrength;
         private GlobalInputMonitor _globalInputMonitor;
@@ -377,24 +560,43 @@ namespace NuoMiDesktopPet
         private bool _localBongoRightMousePress;
         private PetHitZone _pointerDownZone;
         private bool _hasShownWelcome;
+        private System.Windows.Threading.DispatcherTimer _fullscreenTimer;
+        private Drawing.Rectangle _lastPetPixelBounds;
+        private bool _hasLastPetPixelBounds;
+        private int _fullscreenEnterSamples;
+        private int _fullscreenExitSamples;
+        private long _fullscreenBypassEarliestResetAt;
+        private FullscreenSample _lastFullscreenSample =
+            FullscreenSample.Unknown;
+        private IntPtr _lastFullscreenWindow;
+        private IntPtr _bypassedFullscreenWindow;
         private System.Windows.Threading.DispatcherTimer _diagnosticTimer;
         private string _diagnosticPreviewDirectory;
         private int _diagnosticPreviewStep;
         private bool _isDiagnosticPreview;
+        private HwndSource _windowSource;
 
-        public PetWindow(bool diagnosticPreview)
+        public PetWindow(bool diagnosticPreview, bool startHidden)
         {
             _isDiagnosticPreview = diagnosticPreview;
+            _userHidden = startHidden;
             Title = AppName;
             Width = BaseWidth;
             Height = BaseHeight;
-            MinWidth = BaseWidth * 0.65;
-            MinHeight = BaseHeight * 0.65;
+            MinWidth =
+                BaseWidth * MinimumScalePercentage / 100.0;
+            MinHeight =
+                BaseHeight * MinimumScalePercentage / 100.0;
+            MaxWidth =
+                BaseWidth * MaximumScalePercentage / 100.0;
+            MaxHeight =
+                BaseHeight * MaximumScalePercentage / 100.0;
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
             AllowsTransparency = true;
             Background = WpfBrushes.Transparent;
             ShowInTaskbar = false;
+            ShowActivated = false;
             Topmost = true;
             Focusable = true;
             SnapsToDevicePixels = false;
@@ -415,7 +617,10 @@ namespace NuoMiDesktopPet
             LoadSettings();
             LoadPetState();
             _behavior.AdvanceNeeds(DateTime.UtcNow, false);
-            _behavior.ScheduleNext(_clock.ElapsedMilliseconds, 9000, 18000);
+            ScheduleNextAutonomous(
+                _clock.ElapsedMilliseconds,
+                5000,
+                10000);
             ApplyScale(false);
             RestoreOrChooseInitialPosition();
             RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.HighQuality);
@@ -443,6 +648,11 @@ namespace NuoMiDesktopPet
             SourceInitialized += PetSourceInitialized;
 
             SystemEvents.DisplaySettingsChanged += DisplaySettingsChanged;
+
+            if (!_isDiagnosticPreview)
+            {
+                new WindowInteropHelper(this).EnsureHandle();
+            }
         }
 
         public void BeginDiagnosticPreviewSequence(string outputDirectory)
@@ -569,8 +779,55 @@ namespace NuoMiDesktopPet
                         TimeSpan.FromMilliseconds(80);
                     break;
 
-                default:
+                case 13:
                     CaptureCurrentFrame("refined-blink-recovered.png");
+                    _userScale = 0.60;
+                    ApplyScale(false);
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(120);
+                    break;
+
+                case 14:
+                    CaptureCurrentFrame("refined-scale-60.png");
+                    StartBehavior(CatBehavior.CupPush, true);
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(720);
+                    break;
+
+                case 15:
+                    CaptureCurrentFrame(
+                        "refined-scale-60-cup.png");
+                    CaptureActivePropFrame(
+                        "refined-scale-60-cup-prop.png");
+                    ValidateActivePropForDiagnostic(
+                        "60%-cup");
+                    CancelBehavior(
+                        _clock.ElapsedMilliseconds);
+                    _userScale = 1.50;
+                    ApplyScale(false);
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(120);
+                    break;
+
+                case 16:
+                    CaptureCurrentFrame("refined-scale-150.png");
+                    StartBehavior(CatBehavior.Playing, true);
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(720);
+                    break;
+
+                case 17:
+                    CaptureCurrentFrame(
+                        "refined-scale-150-ball.png");
+                    CaptureActivePropFrame(
+                        "refined-scale-150-ball-prop.png");
+                    ValidateActivePropForDiagnostic(
+                        "150%-ball");
+                    _diagnosticTimer.Interval =
+                        TimeSpan.FromMilliseconds(40);
+                    break;
+
+                default:
                     _diagnosticTimer.Stop();
                     _diagnosticTimer.Tick -= DiagnosticPreviewTick;
                     _diagnosticTimer = null;
@@ -628,6 +885,118 @@ namespace NuoMiDesktopPet
             using (FileStream stream = File.Create(path))
             {
                 encoder.Save(stream);
+            }
+        }
+
+        private void CaptureActivePropFrame(string fileName)
+        {
+            if (_activeProp == null ||
+                !_activeProp.IsVisible)
+            {
+                throw new InvalidOperationException(
+                    "The diagnostic prop is not visible.");
+            }
+
+            _activeProp.UpdateLayout();
+            int width = Math.Max(
+                1,
+                (int)Math.Ceiling(
+                    _activeProp.ActualWidth));
+            int height = Math.Max(
+                1,
+                (int)Math.Ceiling(
+                    _activeProp.ActualHeight));
+            RenderTargetBitmap bitmap =
+                new RenderTargetBitmap(
+                    width,
+                    height,
+                    96.0,
+                    96.0,
+                    PixelFormats.Pbgra32);
+            bitmap.Render(_activeProp);
+
+            PngBitmapEncoder encoder =
+                new PngBitmapEncoder();
+            encoder.Frames.Add(
+                BitmapFrame.Create(bitmap));
+            string path = Path.Combine(
+                _diagnosticPreviewDirectory,
+                fileName);
+            using (FileStream stream = File.Create(path))
+            {
+                encoder.Save(stream);
+            }
+        }
+
+        private void ValidateActivePropForDiagnostic(
+            string label)
+        {
+            if (_activeProp == null)
+            {
+                throw new InvalidOperationException(
+                    "The diagnostic prop was not created.");
+            }
+
+            NativeRect petBounds;
+            if (!TryGetPetWindowRect(out petBounds))
+            {
+                throw new InvalidOperationException(
+                    "The diagnostic pet bounds are unavailable.");
+            }
+
+            Drawing.Rectangle propBounds =
+                _activeProp.GetPixelBounds();
+            Drawing.Rectangle petRectangle =
+                Drawing.Rectangle.FromLTRB(
+                    petBounds.Left,
+                    petBounds.Top,
+                    petBounds.Right,
+                    petBounds.Bottom);
+            Drawing.Rectangle workArea =
+                Forms.Screen.FromRectangle(
+                    petRectangle).WorkingArea;
+            double physicalScale =
+                petRectangle.Width / BaseWidth;
+            double expectedSize =
+                128.0 * physicalScale;
+            double tolerance =
+                Math.Max(3.0, expectedSize * 0.045);
+            bool sizeIsCorrect =
+                Math.Abs(
+                    propBounds.Width -
+                    expectedSize) <= tolerance &&
+                Math.Abs(
+                    propBounds.Height -
+                    expectedSize) <= tolerance;
+            bool isInsideWorkArea =
+                propBounds.Left >= workArea.Left - 1 &&
+                propBounds.Top >= workArea.Top - 1 &&
+                propBounds.Right <= workArea.Right + 1 &&
+                propBounds.Bottom <= workArea.Bottom + 1;
+
+            string report = String.Format(
+                CultureInfo.InvariantCulture,
+                "{0}: actual={1}x{2}, expected={3:0.0}, workArea={4},{5},{6},{7}, pass={8}\r\n",
+                label,
+                propBounds.Width,
+                propBounds.Height,
+                expectedSize,
+                workArea.Left,
+                workArea.Top,
+                workArea.Width,
+                workArea.Height,
+                sizeIsCorrect && isInsideWorkArea);
+            File.AppendAllText(
+                Path.Combine(
+                    _diagnosticPreviewDirectory,
+                    "prop-diagnostics.txt"),
+                report);
+
+            if (!sizeIsCorrect ||
+                !isInsideWorkArea)
+            {
+                throw new InvalidOperationException(
+                    "The diagnostic prop failed size or placement validation.");
             }
         }
 
@@ -1324,7 +1693,26 @@ namespace NuoMiDesktopPet
 
         private void PetSourceInitialized(object sender, EventArgs e)
         {
-            EnsureVisibleOnAnyScreen();
+            IntPtr handle =
+                new WindowInteropHelper(this).Handle;
+            _windowSource =
+                HwndSource.FromHwnd(handle);
+            if (_windowSource != null)
+            {
+                _windowSource.AddHook(PetWindowProc);
+            }
+
+            NativeRect rect;
+            TryGetPetWindowRect(out rect);
+            if (IsVisible)
+            {
+                EnsureVisibleOnAnyScreen();
+            }
+            else
+            {
+                _needsVisibilityCorrection = true;
+            }
+            StartFullscreenMonitoring();
         }
 
         private void PetWindowIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
@@ -1335,11 +1723,18 @@ namespace NuoMiDesktopPet
                 {
                     _needsVisibilityCorrection = false;
                     EnsureVisibleOnAnyScreen();
+                    if (!_isDiagnosticPreview)
+                    {
+                        SavePosition();
+                    }
                 }
                 _behavior.AdvanceNeeds(DateTime.UtcNow, false);
                 if (!_behavior.IsBusy)
                 {
-                    _behavior.ScheduleNext(_clock.ElapsedMilliseconds, 8000, 17000);
+                    ScheduleNextAutonomous(
+                        _clock.ElapsedMilliseconds,
+                        5000,
+                        10000);
                 }
                 StartInputMonitoring();
                 StartRendering();
@@ -1352,6 +1747,198 @@ namespace NuoMiDesktopPet
                 SavePetState();
                 StopRendering();
             }
+            UpdateTrayDescription();
+        }
+
+        private void StartFullscreenMonitoring()
+        {
+            if (_isDiagnosticPreview ||
+                _isExiting ||
+                _fullscreenTimer != null)
+            {
+                return;
+            }
+
+            _fullscreenTimer =
+                new System.Windows.Threading.DispatcherTimer(
+                    System.Windows.Threading.DispatcherPriority.Background,
+                    Dispatcher);
+            _fullscreenTimer.Interval =
+                TimeSpan.FromMilliseconds(500);
+            _fullscreenTimer.Tick += FullscreenMonitorTick;
+            _fullscreenTimer.Start();
+        }
+
+        private void StopFullscreenMonitoring()
+        {
+            if (_fullscreenTimer == null)
+            {
+                return;
+            }
+
+            _fullscreenTimer.Stop();
+            _fullscreenTimer.Tick -= FullscreenMonitorTick;
+            _fullscreenTimer = null;
+        }
+
+        private void FullscreenMonitorTick(object sender, EventArgs e)
+        {
+            if (_isExiting ||
+                _isDiagnosticPreview ||
+                !_autoHideFullscreen)
+            {
+                return;
+            }
+
+            Drawing.Rectangle petBounds;
+            if (!TryGetFullscreenPetBounds(out petBounds))
+            {
+                _lastFullscreenSample = FullscreenSample.Unknown;
+                return;
+            }
+
+            IntPtr foregroundWindow;
+            FullscreenSample sample = FullscreenDetector.Sample(
+                petBounds,
+                out foregroundWindow);
+            _lastFullscreenSample = sample;
+            long now = _clock.ElapsedMilliseconds;
+
+            if (sample == FullscreenSample.FullscreenOnPetMonitor)
+            {
+                _fullscreenExitSamples = 0;
+                if (_fullscreenBypassUntilExit &&
+                    _bypassedFullscreenWindow != IntPtr.Zero &&
+                    foregroundWindow != IntPtr.Zero &&
+                    foregroundWindow !=
+                        _bypassedFullscreenWindow)
+                {
+                    // A different foreground full-screen HWND marks a new
+                    // movie/game session. A manual "show anyway" exception
+                    // from the previous session must not leak into this one.
+                    _fullscreenBypassUntilExit = false;
+                    _bypassedFullscreenWindow = IntPtr.Zero;
+                }
+
+                _lastFullscreenWindow = foregroundWindow;
+                if (_fullscreenBypassUntilExit &&
+                    _bypassedFullscreenWindow == IntPtr.Zero)
+                {
+                    _bypassedFullscreenWindow = foregroundWindow;
+                }
+
+                if (_fullscreenBypassUntilExit ||
+                    _userHidden ||
+                    _fullscreenSuppressed ||
+                    ShouldPostponeFullscreenHide())
+                {
+                    _fullscreenEnterSamples = 0;
+                    return;
+                }
+
+                _fullscreenEnterSamples++;
+                if (_fullscreenEnterSamples >= 2)
+                {
+                    _fullscreenEnterSamples = 0;
+                    HideForFullscreen();
+                }
+                return;
+            }
+
+            if (sample != FullscreenSample.NotFullscreen)
+            {
+                return;
+            }
+
+            _fullscreenEnterSamples = 0;
+            _fullscreenExitSamples++;
+            bool hasExitedFullscreen =
+                _fullscreenExitSamples >= 3;
+            if (_fullscreenBypassUntilExit &&
+                hasExitedFullscreen &&
+                now >= _fullscreenBypassEarliestResetAt)
+            {
+                _fullscreenBypassUntilExit = false;
+                _bypassedFullscreenWindow = IntPtr.Zero;
+            }
+
+            if (_fullscreenSuppressed &&
+                !_userHidden &&
+                hasExitedFullscreen)
+            {
+                _fullscreenExitSamples = 0;
+                RestoreAfterFullscreen();
+            }
+
+            if (hasExitedFullscreen)
+            {
+                _lastFullscreenWindow = IntPtr.Zero;
+            }
+        }
+
+        private bool TryGetFullscreenPetBounds(
+            out Drawing.Rectangle bounds)
+        {
+            NativeRect nativeBounds;
+            if (TryGetPetWindowRect(out nativeBounds))
+            {
+                bounds = Drawing.Rectangle.FromLTRB(
+                    nativeBounds.Left,
+                    nativeBounds.Top,
+                    nativeBounds.Right,
+                    nativeBounds.Bottom);
+                return bounds.Width > 0 && bounds.Height > 0;
+            }
+
+            bounds = _lastPetPixelBounds;
+            return _hasLastPetPixelBounds &&
+                   bounds.Width > 0 &&
+                   bounds.Height > 0;
+        }
+
+        private bool ShouldPostponeFullscreenHide()
+        {
+            return
+                _isDragging ||
+                _dragPending ||
+                IsMouseCaptured ||
+                (_petMenu != null && _petMenu.IsOpen) ||
+                (_trayMenu != null && _trayMenu.Visible);
+        }
+
+        private void HideForFullscreen()
+        {
+            if (_userHidden ||
+                _fullscreenBypassUntilExit ||
+                _fullscreenSuppressed)
+            {
+                return;
+            }
+
+            NativeRect ignored;
+            TryGetPetWindowRect(out ignored);
+            _fullscreenSuppressed = true;
+            CloseActiveProp();
+            if (IsVisible)
+            {
+                Hide();
+            }
+            UpdateTrayDescription();
+        }
+
+        private void RestoreAfterFullscreen()
+        {
+            if (!_fullscreenSuppressed)
+            {
+                return;
+            }
+
+            _fullscreenSuppressed = false;
+            if (!_userHidden)
+            {
+                ShowPetWindow();
+            }
+            UpdateTrayDescription();
         }
 
         private void ShowWelcomeIfNeeded()
@@ -1363,15 +1950,36 @@ namespace NuoMiDesktopPet
                 return;
             }
 
+            if (_autoHideFullscreen)
+            {
+                Drawing.Rectangle petBounds;
+                IntPtr foregroundWindow;
+                if (TryGetFullscreenPetBounds(out petBounds))
+                {
+                    FullscreenSample sample =
+                        FullscreenDetector.Sample(
+                            petBounds,
+                            out foregroundWindow);
+                    _lastFullscreenSample = sample;
+                    if (sample ==
+                        FullscreenSample.FullscreenOnPetMonitor)
+                    {
+                        _lastFullscreenWindow =
+                            foregroundWindow;
+                        return;
+                    }
+                }
+            }
+
             _hasShownWelcome = true;
             SaveSimpleSetting("HasShownWelcome", 1);
             ShowMessage(
-                "嗨，我是糯米~",
-                2400,
+                "右键我，可以互动和设置哦",
+                5200,
                 _clock.ElapsedMilliseconds);
             _notifyIcon.BalloonTipTitle = "你好，我是糯米";
             _notifyIcon.BalloonTipText =
-                "点我可以摸摸，碰尾巴会有反应；按住拖动可以搬家，右键还有小鱼干、毛线球和更多设置。";
+                "按住我可以拖动搬家；如果隐藏了，双击右下角托盘图标，或者再次打开 EXE 就能把我叫回来。";
             _notifyIcon.BalloonTipIcon = Forms.ToolTipIcon.Info;
             _notifyIcon.ShowBalloonTip(5200);
         }
@@ -1402,10 +2010,17 @@ namespace NuoMiDesktopPet
 
         private void PetWindowClosed(object sender, EventArgs e)
         {
+            if (_windowSource != null)
+            {
+                _windowSource.RemoveHook(PetWindowProc);
+                _windowSource = null;
+            }
+            StopFullscreenMonitoring();
             DisposeInputMonitor();
             StopRendering();
             CloseActiveProp();
             IsVisibleChanged -= PetWindowIsVisibleChanged;
+            SourceInitialized -= PetSourceInitialized;
             SystemEvents.DisplaySettingsChanged -= DisplaySettingsChanged;
             Closed -= PetWindowClosed;
         }
@@ -1416,102 +2031,191 @@ namespace NuoMiDesktopPet
             _petMenu.FontFamily = new FontFamily("Microsoft YaHei UI");
             _petMenu.FontSize = 13;
 
-            _showHideMenuItem = AddPetMenuItem("隐藏宠物（后台运行）", TogglePetVisibility);
+            _showHideMenuItem = AddPetMenuItem(
+                "隐藏到托盘（继续运行）",
+                TogglePetVisibility);
+            _showHideMenuItem.Tag = "NuoMi.Accent";
 
-            _followMenuItem = AddPetMenuItem("跟随鼠标转头", delegate
-            {
-                _followMouse = _followMenuItem.IsChecked;
-                SaveSimpleSetting("FollowMouse", _followMouse ? 1 : 0);
-            });
-            _followMenuItem.IsCheckable = true;
+            WpfMenuItem interactionRoot = new WpfMenuItem();
+            interactionRoot.Header = "和糯米互动";
+            AddChildMenuItem(
+                interactionRoot,
+                "打个招呼",
+                ShowGreeting);
+            AddChildMenuItem(
+                interactionRoot,
+                "摸摸头",
+                PetTheCat);
+            AddChildMenuItem(
+                interactionRoot,
+                "喂小鱼干",
+                FeedTheCat);
+            AddChildMenuItem(
+                interactionRoot,
+                "逗它玩",
+                PlayWithTheCat);
+            AddChildMenuItem(
+                interactionRoot,
+                "放个杯子",
+                PlaceCupForCat);
+            AddChildMenuItem(
+                interactionRoot,
+                "查看状态",
+                ShowPetStatus);
+            _petMenu.Items.Add(interactionRoot);
 
-            _startupMenuItem = AddPetMenuItem("开机自动启动", delegate
-            {
-                SetStartupEnabled(_startupMenuItem.IsChecked);
-                _startupMenuItem.IsChecked = IsStartupEnabled();
-            });
-            _startupMenuItem.IsCheckable = true;
+            _petMenu.Items.Add(new WpfSeparator());
 
-            _topmostMenuItem = AddPetMenuItem("始终在最前面", delegate
-            {
-                Topmost = _topmostMenuItem.IsChecked;
-                if (_activeProp != null)
-                {
-                    _activeProp.Topmost = Topmost;
-                }
-                SaveSimpleSetting("Topmost", Topmost ? 1 : 0);
-            });
-            _topmostMenuItem.IsCheckable = true;
-
-            _bongoModeMenuItem = AddPetMenuItem("跟着键盘鼠标动（Bongo）", delegate
+            _bongoModeMenuItem = AddPetMenuItem(
+                "键盘鼠标互动（Bongo）",
+                delegate
             {
                 SetBongoMode(_bongoModeMenuItem.IsChecked);
             });
             _bongoModeMenuItem.IsCheckable = true;
 
-            WpfMenuItem motionPersonalityRoot = new WpfMenuItem();
-            motionPersonalityRoot.Header = "动作活泼程度";
-            AddMotionPersonalityMenuItem(
-                motionPersonalityRoot,
-                "轻柔",
-                MotionPersonality.Quiet);
-            AddMotionPersonalityMenuItem(
-                motionPersonalityRoot,
-                "自然（推荐）",
-                MotionPersonality.Natural);
-            AddMotionPersonalityMenuItem(
-                motionPersonalityRoot,
-                "活泼",
-                MotionPersonality.Playful);
-            _petMenu.Items.Add(motionPersonalityRoot);
-
-            _autoInteractionMenuItem = AddPetMenuItem("空闲时自己玩耍", delegate
+            _autoInteractionMenuItem = AddPetMenuItem("自己活动", delegate
             {
                 _autoInteraction = _autoInteractionMenuItem.IsChecked;
-                SaveSimpleSetting("AutoInteraction", _autoInteraction ? 1 : 0);
+                SaveSimpleSetting(
+                    "AutoInteraction",
+                    _autoInteraction ? 1 : 0);
                 if (!_autoInteraction)
                 {
                     CancelBehavior(_clock.ElapsedMilliseconds);
                 }
                 else
                 {
-                    _behavior.ScheduleNext(_clock.ElapsedMilliseconds, 7000, 16000);
+                    ScheduleNextAutonomous(
+                        _clock.ElapsedMilliseconds,
+                        5000,
+                        10000);
                 }
             });
             _autoInteractionMenuItem.IsCheckable = true;
 
-            _petMenu.Items.Add(new WpfSeparator());
-
-            WpfMenuItem interactionRoot = new WpfMenuItem();
-            interactionRoot.Header = "和糯米互动";
-            AddChildMenuItem(interactionRoot, "摸摸头", PetTheCat);
-            AddChildMenuItem(interactionRoot, "喂小鱼干", FeedTheCat);
-            AddChildMenuItem(interactionRoot, "逗它玩", PlayWithTheCat);
-            AddChildMenuItem(interactionRoot, "放个杯子试试", PlaceCupForCat);
-            AddChildMenuItem(interactionRoot, "查看状态", ShowPetStatus);
-            _petMenu.Items.Add(interactionRoot);
-
-            WpfMenuItem sizeRoot = new WpfMenuItem();
-            sizeRoot.Header = "宠物大小";
-            AddSizeMenuItem(sizeRoot, "小巧", 0.80);
-            AddSizeMenuItem(sizeRoot, "标准", 1.00);
-            AddSizeMenuItem(sizeRoot, "大号", 1.25);
-            _petMenu.Items.Add(sizeRoot);
-
-            AddPetMenuItem("回到主屏幕", MoveToPrimaryScreen);
-            AddPetMenuItem("和糯米打招呼", ShowGreeting);
+            _motionPersonalityRootMenuItem =
+                new WpfMenuItem();
+            _motionPersonalityRootMenuItem.Header =
+                "陪伴风格";
+            AddMotionPersonalityMenuItem(
+                _motionPersonalityRootMenuItem,
+                "安静陪伴",
+                MotionPersonality.Quiet);
+            AddMotionPersonalityMenuItem(
+                _motionPersonalityRootMenuItem,
+                "自然（推荐）",
+                MotionPersonality.Natural);
+            AddMotionPersonalityMenuItem(
+                _motionPersonalityRootMenuItem,
+                "活泼",
+                MotionPersonality.Playful);
+            _petMenu.Items.Add(
+                _motionPersonalityRootMenuItem);
 
             _petMenu.Items.Add(new WpfSeparator());
 
+            _sizeRootMenuItem = new WpfMenuItem();
+            AddSizeMenuItem(_sizeRootMenuItem, "迷你 60%", 60);
+            AddSizeMenuItem(_sizeRootMenuItem, "小巧 80%", 80);
+            AddSizeMenuItem(_sizeRootMenuItem, "标准 100%", 100);
+            AddSizeMenuItem(_sizeRootMenuItem, "大号 125%", 125);
+            AddSizeMenuItem(_sizeRootMenuItem, "特大 150%", 150);
+            _sizeRootMenuItem.Items.Add(new WpfSeparator());
+            AddChildMenuItem(
+                _sizeRootMenuItem,
+                "自定义百分比…",
+                ShowScaleDialog);
+            _petMenu.Items.Add(_sizeRootMenuItem);
+
+            WpfMenuItem moreSettingsRoot =
+                new WpfMenuItem();
+            moreSettingsRoot.Header = "更多设置";
+
+            _followMenuItem = AddChildMenuItem(
+                moreSettingsRoot,
+                "跟随鼠标转头",
+                delegate
+                {
+                    _followMouse = _followMenuItem.IsChecked;
+                    SaveSimpleSetting(
+                        "FollowMouse",
+                        _followMouse ? 1 : 0);
+                });
+            _followMenuItem.IsCheckable = true;
+
+            _topmostMenuItem = AddChildMenuItem(
+                moreSettingsRoot,
+                "保持在其他窗口前面",
+                delegate
+                {
+                    Topmost = _topmostMenuItem.IsChecked;
+                    if (_activeProp != null)
+                    {
+                        _activeProp.Topmost = Topmost;
+                    }
+                    SaveSimpleSetting(
+                        "Topmost",
+                        Topmost ? 1 : 0);
+                });
+            _topmostMenuItem.IsCheckable = true;
+
+            _autoHideFullscreenMenuItem =
+                AddChildMenuItem(
+                    moreSettingsRoot,
+                    "全屏时自动隐藏",
+                    delegate
+                    {
+                        SetAutoHideFullscreen(
+                            _autoHideFullscreenMenuItem
+                                .IsChecked);
+                    });
+            _autoHideFullscreenMenuItem.IsCheckable = true;
+
+            _startupMenuItem = AddChildMenuItem(
+                moreSettingsRoot,
+                "开机自动显示糯米",
+                delegate
+                {
+                    SetStartupEnabled(
+                        _startupMenuItem.IsChecked);
+                    _startupMenuItem.IsChecked =
+                        IsStartupEnabled();
+                });
+            _startupMenuItem.IsCheckable = true;
+            moreSettingsRoot.Items.Add(new WpfSeparator());
+            AddChildMenuItem(
+                moreSettingsRoot,
+                "恢复推荐设置…",
+                ResetRecommendedSettings);
+            _petMenu.Items.Add(moreSettingsRoot);
+
+            _petMenu.Items.Add(new WpfSeparator());
+
+            AddPetMenuItem(
+                "找回糯米（移到主屏幕）",
+                MoveToPrimaryScreen);
+            AddPetMenuItem("使用帮助", ShowHelp);
             AddPetMenuItem("关于糯米", ShowAbout);
-            AddPetMenuItem("退出", ExitApplication);
+            _petMenu.Items.Add(new WpfSeparator());
 
-            _petMenu.Opened += delegate
+            WpfMenuItem exitItem = AddPetMenuItem(
+                "退出程序（停止运行）",
+                ExitApplication);
+            exitItem.Tag = "NuoMi.Danger";
+
+            ContextMenuOpening += delegate
             {
+                PauseAutonomousForMenu();
                 RefreshMenuState();
+                FlatContextMenuStyle.PrepareForOpening(
+                    _petMenu,
+                    this);
             };
 
+            FlatContextMenuStyle.Apply(_petMenu);
             ContextMenu = _petMenu;
+            RefreshMenuState();
         }
 
         private WpfMenuItem AddPetMenuItem(string header, Action action)
@@ -1541,15 +2245,18 @@ namespace NuoMiDesktopPet
             return item;
         }
 
-        private void AddSizeMenuItem(WpfMenuItem parent, string header, double scale)
+        private void AddSizeMenuItem(
+            WpfMenuItem parent,
+            string header,
+            int percentage)
         {
             WpfMenuItem item = new WpfMenuItem();
             item.Header = header;
             item.IsCheckable = true;
-            item.Tag = scale;
+            item.Tag = percentage;
             item.Click += delegate
             {
-                SetUserScale(scale);
+                SetUserScale(percentage / 100.0);
             };
             parent.Items.Add(item);
             _sizeMenuItems.Add(item);
@@ -1574,57 +2281,55 @@ namespace NuoMiDesktopPet
 
         private void BuildTrayMenu()
         {
-            _trayMenu = new Forms.ContextMenuStrip();
-            _trayMenu.Font = new Drawing.Font("Microsoft YaHei UI", 9.5F);
+            _trayMenu =
+                TrayMenuTheme.CreateContextMenu();
             _trayMenu.ShowImageMargin = false;
             _trayMenu.ShowCheckMargin = true;
 
             _trayShowHideItem = new Forms.ToolStripMenuItem();
-            _trayShowHideItem.Click += delegate { Dispatcher.BeginInvoke((Action)TogglePetVisibility); };
+            _trayShowHideItem.Tag = "NuoMi.Accent";
+            _trayShowHideItem.Click += delegate
+            {
+                Dispatcher.BeginInvoke(
+                    (Action)TogglePetVisibility);
+            };
             _trayMenu.Items.Add(_trayShowHideItem);
 
-            _trayFollowItem = new Forms.ToolStripMenuItem("跟随鼠标转头");
-            _trayFollowItem.CheckOnClick = true;
-            _trayFollowItem.Click += delegate
-            {
-                Dispatcher.BeginInvoke((Action)delegate
-                {
-                    _followMouse = _trayFollowItem.Checked;
-                    SaveSimpleSetting("FollowMouse", _followMouse ? 1 : 0);
-                });
-            };
-            _trayMenu.Items.Add(_trayFollowItem);
+            Forms.ToolStripMenuItem interactionRoot =
+                new Forms.ToolStripMenuItem(
+                    "和糯米互动");
+            AddTrayAction(
+                interactionRoot.DropDownItems,
+                "打个招呼",
+                ShowGreeting);
+            AddTrayAction(
+                interactionRoot.DropDownItems,
+                "摸摸头",
+                PetTheCat);
+            AddTrayAction(
+                interactionRoot.DropDownItems,
+                "喂小鱼干",
+                FeedTheCat);
+            AddTrayAction(
+                interactionRoot.DropDownItems,
+                "逗它玩",
+                PlayWithTheCat);
+            AddTrayAction(
+                interactionRoot.DropDownItems,
+                "放个杯子",
+                PlaceCupForCat);
+            AddTrayAction(
+                interactionRoot.DropDownItems,
+                "查看状态",
+                ShowPetStatus);
+            _trayMenu.Items.Add(interactionRoot);
 
-            _trayStartupItem = new Forms.ToolStripMenuItem("开机自动启动");
-            _trayStartupItem.CheckOnClick = true;
-            _trayStartupItem.Click += delegate
-            {
-                bool desired = _trayStartupItem.Checked;
-                Dispatcher.BeginInvoke((Action)delegate
-                {
-                    SetStartupEnabled(desired);
-                });
-            };
-            _trayMenu.Items.Add(_trayStartupItem);
+            _trayMenu.Items.Add(
+                new Forms.ToolStripSeparator());
 
-            _trayTopmostItem = new Forms.ToolStripMenuItem("始终在最前面");
-            _trayTopmostItem.CheckOnClick = true;
-            _trayTopmostItem.Click += delegate
-            {
-                bool desired = _trayTopmostItem.Checked;
-                Dispatcher.BeginInvoke((Action)delegate
-                {
-                    Topmost = desired;
-                    if (_activeProp != null)
-                    {
-                        _activeProp.Topmost = Topmost;
-                    }
-                    SaveSimpleSetting("Topmost", Topmost ? 1 : 0);
-                });
-            };
-            _trayMenu.Items.Add(_trayTopmostItem);
-
-            _trayBongoModeItem = new Forms.ToolStripMenuItem("跟着键盘鼠标动（Bongo）");
+            _trayBongoModeItem =
+                new Forms.ToolStripMenuItem(
+                    "键盘鼠标互动（Bongo）");
             _trayBongoModeItem.CheckOnClick = true;
             _trayBongoModeItem.Click += delegate
             {
@@ -1636,10 +2341,42 @@ namespace NuoMiDesktopPet
             };
             _trayMenu.Items.Add(_trayBongoModeItem);
 
+            _trayAutoInteractionItem =
+                new Forms.ToolStripMenuItem(
+                    "自己活动");
+            _trayAutoInteractionItem.CheckOnClick = true;
+            _trayAutoInteractionItem.Click += delegate
+            {
+                bool desired =
+                    _trayAutoInteractionItem.Checked;
+                Dispatcher.BeginInvoke((Action)delegate
+                {
+                    _autoInteraction = desired;
+                    SaveSimpleSetting(
+                        "AutoInteraction",
+                        _autoInteraction ? 1 : 0);
+                    if (!_autoInteraction)
+                    {
+                        CancelBehavior(
+                            _clock.ElapsedMilliseconds);
+                    }
+                    else
+                    {
+                        ScheduleNextAutonomous(
+                            _clock.ElapsedMilliseconds,
+                            5000,
+                            10000);
+                    }
+                });
+            };
+            _trayMenu.Items.Add(
+                _trayAutoInteractionItem);
+
             _trayMotionPersonalityRoot =
-                new Forms.ToolStripMenuItem("动作活泼程度");
+                new Forms.ToolStripMenuItem(
+                    "陪伴风格");
             AddTrayMotionPersonalityItem(
-                "轻柔",
+                "安静陪伴",
                 MotionPersonality.Quiet);
             AddTrayMotionPersonalityItem(
                 "自然（推荐）",
@@ -1649,44 +2386,168 @@ namespace NuoMiDesktopPet
                 MotionPersonality.Playful);
             _trayMenu.Items.Add(_trayMotionPersonalityRoot);
 
-            _trayAutoInteractionItem = new Forms.ToolStripMenuItem("空闲时自己玩耍");
-            _trayAutoInteractionItem.CheckOnClick = true;
-            _trayAutoInteractionItem.Click += delegate
+            _trayMenu.Items.Add(
+                new Forms.ToolStripSeparator());
+
+            _traySizeRoot = new Forms.ToolStripMenuItem();
+            AddTraySizeItem("迷你 60%", 60);
+            AddTraySizeItem("小巧 80%", 80);
+            AddTraySizeItem("标准 100%", 100);
+            AddTraySizeItem("大号 125%", 125);
+            AddTraySizeItem("特大 150%", 150);
+            _traySizeRoot.DropDownItems.Add(
+                new Forms.ToolStripSeparator());
+            _traySizeRoot.DropDownItems.Add(
+                "自定义百分比…",
+                null,
+                delegate
+                {
+                    Dispatcher.BeginInvoke(
+                        (Action)ShowScaleDialog);
+                });
+            _trayMenu.Items.Add(_traySizeRoot);
+
+            Forms.ToolStripMenuItem moreSettingsRoot =
+                new Forms.ToolStripMenuItem(
+                    "更多设置");
+
+            _trayFollowItem =
+                new Forms.ToolStripMenuItem(
+                    "跟随鼠标转头");
+            _trayFollowItem.CheckOnClick = true;
+            _trayFollowItem.Click += delegate
             {
-                bool desired = _trayAutoInteractionItem.Checked;
                 Dispatcher.BeginInvoke((Action)delegate
                 {
-                    _autoInteraction = desired;
-                    SaveSimpleSetting("AutoInteraction", _autoInteraction ? 1 : 0);
-                    if (!_autoInteraction)
-                    {
-                        CancelBehavior(_clock.ElapsedMilliseconds);
-                    }
-                    else
-                    {
-                        _behavior.ScheduleNext(_clock.ElapsedMilliseconds, 7000, 16000);
-                    }
+                    _followMouse =
+                        _trayFollowItem.Checked;
+                    SaveSimpleSetting(
+                        "FollowMouse",
+                        _followMouse ? 1 : 0);
                 });
             };
-            _trayMenu.Items.Add(_trayAutoInteractionItem);
+            moreSettingsRoot.DropDownItems.Add(
+                _trayFollowItem);
 
-            _trayMenu.Items.Add(new Forms.ToolStripSeparator());
-            _trayMenu.Items.Add("摸摸头", null, delegate { Dispatcher.BeginInvoke((Action)PetTheCat); });
-            _trayMenu.Items.Add("喂小鱼干", null, delegate { Dispatcher.BeginInvoke((Action)FeedTheCat); });
-            _trayMenu.Items.Add("逗它玩", null, delegate { Dispatcher.BeginInvoke((Action)PlayWithTheCat); });
-            _trayMenu.Items.Add("放个杯子试试", null, delegate { Dispatcher.BeginInvoke((Action)PlaceCupForCat); });
-            _trayMenu.Items.Add("查看状态", null, delegate { Dispatcher.BeginInvoke((Action)ShowPetStatus); });
-            _trayMenu.Items.Add(new Forms.ToolStripSeparator());
-            _trayMenu.Items.Add("回到主屏幕", null, delegate { Dispatcher.BeginInvoke((Action)MoveToPrimaryScreen); });
-            _trayMenu.Items.Add("和糯米打招呼", null, delegate { Dispatcher.BeginInvoke((Action)ShowGreeting); });
-            _trayMenu.Items.Add("关于糯米", null, delegate { Dispatcher.BeginInvoke((Action)ShowAbout); });
-            _trayMenu.Items.Add("退出", null, delegate { Dispatcher.BeginInvoke((Action)ExitApplication); });
+            _trayTopmostItem =
+                new Forms.ToolStripMenuItem(
+                    "保持在其他窗口前面");
+            _trayTopmostItem.CheckOnClick = true;
+            _trayTopmostItem.Click += delegate
+            {
+                bool desired =
+                    _trayTopmostItem.Checked;
+                Dispatcher.BeginInvoke((Action)delegate
+                {
+                    Topmost = desired;
+                    if (_activeProp != null)
+                    {
+                        _activeProp.Topmost = Topmost;
+                    }
+                    SaveSimpleSetting(
+                        "Topmost",
+                        Topmost ? 1 : 0);
+                });
+            };
+            moreSettingsRoot.DropDownItems.Add(
+                _trayTopmostItem);
+
+            _trayAutoHideFullscreenItem =
+                new Forms.ToolStripMenuItem(
+                    "全屏时自动隐藏");
+            _trayAutoHideFullscreenItem.CheckOnClick = true;
+            _trayAutoHideFullscreenItem.Click += delegate
+            {
+                bool desired =
+                    _trayAutoHideFullscreenItem.Checked;
+                Dispatcher.BeginInvoke((Action)delegate
+                {
+                    SetAutoHideFullscreen(desired);
+                });
+            };
+            moreSettingsRoot.DropDownItems.Add(
+                _trayAutoHideFullscreenItem);
+
+            _trayStartupItem =
+                new Forms.ToolStripMenuItem(
+                    "开机自动显示糯米");
+            _trayStartupItem.CheckOnClick = true;
+            _trayStartupItem.Click += delegate
+            {
+                bool desired =
+                    _trayStartupItem.Checked;
+                Dispatcher.BeginInvoke((Action)delegate
+                {
+                    SetStartupEnabled(desired);
+                });
+            };
+            moreSettingsRoot.DropDownItems.Add(
+                _trayStartupItem);
+            moreSettingsRoot.DropDownItems.Add(
+                new Forms.ToolStripSeparator());
+            AddTrayAction(
+                moreSettingsRoot.DropDownItems,
+                "恢复推荐设置…",
+                ResetRecommendedSettings);
+            _trayMenu.Items.Add(moreSettingsRoot);
+
+            _trayMenu.Items.Add(
+                new Forms.ToolStripSeparator());
+
+            AddTrayAction(
+                _trayMenu.Items,
+                "找回糯米（移到主屏幕）",
+                MoveToPrimaryScreen);
+            AddTrayAction(
+                _trayMenu.Items,
+                "使用帮助",
+                ShowHelp);
+            AddTrayAction(
+                _trayMenu.Items,
+                "关于糯米",
+                ShowAbout);
+
+            _trayMenu.Items.Add(
+                new Forms.ToolStripSeparator());
+            Forms.ToolStripMenuItem exitItem =
+                AddTrayAction(
+                    _trayMenu.Items,
+                    "退出程序（停止运行）",
+                    ExitApplication);
+            exitItem.Tag = "NuoMi.Danger";
 
             _trayMenu.Opening += delegate
             {
+                Dispatcher.BeginInvoke(
+                    (Action)PauseAutonomousForMenu);
                 RefreshTrayMenuState();
             };
             _notifyIcon.ContextMenuStrip = _trayMenu;
+        }
+
+        private Forms.ToolStripMenuItem AddTrayAction(
+            Forms.ToolStripItemCollection items,
+            string text,
+            Action action)
+        {
+            Forms.ToolStripMenuItem item =
+                new Forms.ToolStripMenuItem(text);
+            item.Click += delegate
+            {
+                Dispatcher.BeginInvoke(action);
+            };
+            items.Add(item);
+            return item;
+        }
+
+        private void PauseAutonomousForMenu()
+        {
+            if (_behavior.IsBusy &&
+                !_behaviorWasUserRequested)
+            {
+                CancelBehavior(
+                    _clock.ElapsedMilliseconds);
+            }
         }
 
         private void AddTrayMotionPersonalityItem(
@@ -1707,27 +2568,57 @@ namespace NuoMiDesktopPet
             _trayMotionPersonalityItems.Add(item);
         }
 
+        private void AddTraySizeItem(
+            string text,
+            int percentage)
+        {
+            Forms.ToolStripMenuItem item =
+                new Forms.ToolStripMenuItem(text);
+            item.Tag = percentage;
+            item.Click += delegate
+            {
+                Dispatcher.BeginInvoke((Action)delegate
+                {
+                    SetUserScale(percentage / 100.0);
+                });
+            };
+            _traySizeRoot.DropDownItems.Add(item);
+            _traySizeItems.Add(item);
+        }
+
         private void NotifyIconMouseDoubleClick(object sender, Forms.MouseEventArgs e)
         {
             if (e.Button == Forms.MouseButtons.Left)
             {
-                Dispatcher.BeginInvoke((Action)TogglePetVisibility);
+                Dispatcher.BeginInvoke(
+                    (Action)ShowFromExternalRequest);
             }
         }
 
         private void RefreshMenuState()
         {
-            _showHideMenuItem.Header = IsVisible ? "隐藏宠物（后台运行）" : "显示宠物";
+            _showHideMenuItem.Header = GetShowHideMenuText();
             _followMenuItem.IsChecked = _followMouse;
             _startupMenuItem.IsChecked = IsStartupEnabled();
             _topmostMenuItem.IsChecked = Topmost;
+            _autoHideFullscreenMenuItem.IsChecked =
+                _autoHideFullscreen;
             _bongoModeMenuItem.IsChecked = _bongoMode;
             _autoInteractionMenuItem.IsChecked = _autoInteraction;
+            _motionPersonalityRootMenuItem.Header =
+                "陪伴风格 · " +
+                GetMotionPersonalityLabel();
+            int currentPercentage = GetCurrentScalePercentage();
+            _sizeRootMenuItem.Header =
+                "大小 · " +
+                currentPercentage.ToString(CultureInfo.InvariantCulture) +
+                "%";
 
             for (int i = 0; i < _sizeMenuItems.Count; i++)
             {
-                double itemScale = (double)_sizeMenuItems[i].Tag;
-                _sizeMenuItems[i].IsChecked = Math.Abs(itemScale - _userScale) < 0.01;
+                int itemPercentage = (int)_sizeMenuItems[i].Tag;
+                _sizeMenuItems[i].IsChecked =
+                    itemPercentage == currentPercentage;
             }
 
             for (int i = 0; i < _motionPersonalityMenuItems.Count; i++)
@@ -1741,12 +2632,30 @@ namespace NuoMiDesktopPet
 
         private void RefreshTrayMenuState()
         {
-            _trayShowHideItem.Text = IsVisible ? "隐藏宠物（后台运行）" : "显示宠物";
+            _trayShowHideItem.Text = GetShowHideMenuText();
             _trayFollowItem.Checked = _followMouse;
             _trayStartupItem.Checked = IsStartupEnabled();
             _trayTopmostItem.Checked = Topmost;
+            _trayAutoHideFullscreenItem.Checked =
+                _autoHideFullscreen;
             _trayBongoModeItem.Checked = _bongoMode;
             _trayAutoInteractionItem.Checked = _autoInteraction;
+            _trayMotionPersonalityRoot.Text =
+                "陪伴风格 · " +
+                GetMotionPersonalityLabel();
+            int currentPercentage = GetCurrentScalePercentage();
+            _traySizeRoot.Text =
+                "大小 · " +
+                currentPercentage.ToString(CultureInfo.InvariantCulture) +
+                "%";
+
+            for (int i = 0; i < _traySizeItems.Count; i++)
+            {
+                Forms.ToolStripMenuItem item =
+                    _traySizeItems[i];
+                item.Checked =
+                    (int)item.Tag == currentPercentage;
+            }
 
             for (int i = 0; i < _trayMotionPersonalityItems.Count; i++)
             {
@@ -1758,12 +2667,186 @@ namespace NuoMiDesktopPet
             }
         }
 
+        private string GetShowHideMenuText()
+        {
+            if (IsVisible)
+            {
+                return "隐藏到托盘（继续运行）";
+            }
+            if (_fullscreenSuppressed)
+            {
+                return "全屏中暂时隐藏（点击仍显示）";
+            }
+            return "显示糯米";
+        }
+
+        private string GetMotionPersonalityLabel()
+        {
+            switch (_interactionMotion.Personality)
+            {
+                case MotionPersonality.Quiet:
+                    return "安静";
+                case MotionPersonality.Playful:
+                    return "活泼";
+                default:
+                    return "自然";
+            }
+        }
+
+        private void UpdateTrayDescription()
+        {
+            if (_notifyIcon == null)
+            {
+                return;
+            }
+
+            if (_fullscreenSuppressed)
+            {
+                _notifyIcon.Text =
+                    "糯米全屏时暂时隐藏｜双击显示";
+            }
+            else if (!IsVisible)
+            {
+                _notifyIcon.Text =
+                    "糯米正在后台｜双击显示，右键打开菜单";
+            }
+            else
+            {
+                _notifyIcon.Text =
+                    "糯米桌面宠物｜右键互动和设置";
+            }
+        }
+
+        private void SetAutoHideFullscreen(bool enabled)
+        {
+            _autoHideFullscreen = enabled;
+            SaveSimpleSetting(
+                "AutoHideFullscreen",
+                enabled ? 1 : 0);
+            _fullscreenEnterSamples = 0;
+            _fullscreenExitSamples = 0;
+            _lastFullscreenWindow = IntPtr.Zero;
+            _bypassedFullscreenWindow = IntPtr.Zero;
+
+            if (!enabled)
+            {
+                _fullscreenBypassUntilExit = false;
+                if (_fullscreenSuppressed && !_userHidden)
+                {
+                    RestoreAfterFullscreen();
+                }
+                else
+                {
+                    _fullscreenSuppressed = false;
+                }
+            }
+
+            RefreshMenuState();
+            RefreshTrayMenuState();
+            UpdateTrayDescription();
+        }
+
+        private int GetCurrentScalePercentage()
+        {
+            return (int)Math.Round(
+                _userScale * 100.0,
+                MidpointRounding.AwayFromZero);
+        }
+
+        private void ShowScaleDialog()
+        {
+            using (ScaleDialog dialog = new ScaleDialog(
+                GetCurrentScalePercentage(),
+                MinimumScalePercentage,
+                MaximumScalePercentage))
+            {
+                dialog.TopMost = Topmost;
+                Forms.DialogResult result;
+                IntPtr handle = new WindowInteropHelper(this).Handle;
+                if (IsVisible && handle != IntPtr.Zero)
+                {
+                    dialog.StartPosition =
+                        Forms.FormStartPosition.CenterParent;
+                    result = dialog.ShowDialog(
+                        new WindowHandleOwner(handle));
+                }
+                else
+                {
+                    dialog.CenterOnCursorScreen();
+                    result = dialog.ShowDialog();
+                }
+
+                if (result == Forms.DialogResult.OK)
+                {
+                    SetUserScale(
+                        dialog.SelectedPercentage / 100.0);
+                }
+            }
+        }
+
+        private void ResetRecommendedSettings()
+        {
+            MessageBoxResult result =
+                System.Windows.MessageBox.Show(
+                    this,
+                    "将恢复这些推荐设置：\n\n" +
+                    "• 糯米大小 80%\n" +
+                    "• 自然陪伴、自己活动和键盘鼠标互动\n" +
+                    "• 跟随鼠标、保持在其他窗口前面\n" +
+                    "• 全屏时自动隐藏\n\n" +
+                    "亲密度、宠物状态和开机自启不会被清除。",
+                    "恢复推荐设置",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question,
+                    MessageBoxResult.No);
+            if (result != MessageBoxResult.Yes)
+            {
+                return;
+            }
+
+            _followMouse = true;
+            Topmost = true;
+            if (_activeProp != null)
+            {
+                _activeProp.Topmost = true;
+            }
+            _autoInteraction = true;
+            SaveSimpleSetting("FollowMouse", 1);
+            SaveSimpleSetting("Topmost", 1);
+            SaveSimpleSetting("AutoInteraction", 1);
+
+            SetAutoHideFullscreen(true);
+            SetMotionPersonality(
+                MotionPersonality.Natural);
+            SetBongoMode(true);
+            SetUserScale(0.80);
+            ScheduleNextAutonomous(
+                _clock.ElapsedMilliseconds,
+                5000,
+                10000);
+            MoveToPrimaryScreen();
+            RefreshMenuState();
+            RefreshTrayMenuState();
+            ShowMessage(
+                "已经恢复推荐设置啦",
+                2200,
+                _clock.ElapsedMilliseconds);
+            InvalidateVisual();
+        }
+
         private void SetMotionPersonality(MotionPersonality personality)
         {
             _interactionMotion.Personality = personality;
             SaveSimpleSetting("MotionPersonality", (int)personality);
             RefreshMenuState();
             RefreshTrayMenuState();
+            if (_autoInteraction && !_behavior.IsBusy)
+            {
+                ScheduleNextAutonomous(
+                    _clock.ElapsedMilliseconds,
+                    8000,
+                    15000);
+            }
 
             string message;
             switch (personality)
@@ -1797,10 +2880,10 @@ namespace NuoMiDesktopPet
                 {
                     if (_autoInteraction)
                     {
-                        _behavior.ScheduleNext(
+                        ScheduleNextAutonomous(
                             _clock.ElapsedMilliseconds,
-                            7000,
-                            16000);
+                            8000,
+                            15000);
                     }
                     ShowMessage(
                         "键鼠同步开启啦",
@@ -1813,10 +2896,10 @@ namespace NuoMiDesktopPet
                 StopInputMonitoring();
                 if (_autoInteraction)
                 {
-                    _behavior.ScheduleNext(
+                    ScheduleNextAutonomous(
                         _clock.ElapsedMilliseconds,
-                        7000,
-                        16000);
+                        8000,
+                        15000);
                 }
                 ShowMessage(
                     "去自由玩耍啦",
@@ -2146,9 +3229,12 @@ namespace NuoMiDesktopPet
 
         private void InterruptAutonomousBehaviorForBongo(long now)
         {
-            if (_behavior.IsBusy && _behavior.Priority < 80)
+            if (_behavior.IsBusy &&
+                _behavior.Priority < 80 &&
+                IsBehaviorConflictingWithBongo(_behavior.Current) &&
+                _behaviorInputConflictStartedAt < 0L)
             {
-                CancelBehavior(now);
+                _behaviorInputConflictStartedAt = now;
             }
         }
 
@@ -2156,8 +3242,21 @@ namespace NuoMiDesktopPet
         {
             if (IsVisible)
             {
+                bool fullscreenWasActive =
+                    _lastFullscreenSample ==
+                        FullscreenSample.FullscreenOnPetMonitor ||
+                    _fullscreenBypassUntilExit;
+                _userHidden = true;
+                _fullscreenSuppressed = false;
+                _fullscreenBypassUntilExit = false;
+                _lastFullscreenWindow = IntPtr.Zero;
+                _bypassedFullscreenWindow = IntPtr.Zero;
+                _fullscreenEnterSamples = 0;
+                _fullscreenExitSamples = 0;
+                CloseActiveProp();
                 Hide();
-                if (!_hasShownBackgroundTip)
+                if (!_hasShownBackgroundTip &&
+                    !fullscreenWasActive)
                 {
                     _notifyIcon.BalloonTipTitle = AppName;
                     _notifyIcon.BalloonTipText = "糯米已在后台运行。双击系统托盘图标，可以随时把它叫回来。";
@@ -2168,10 +3267,55 @@ namespace NuoMiDesktopPet
             }
             else
             {
-                Show();
-                EnsureVisibleOnAnyScreen();
-                Activate();
+                PrepareManualShow();
+                ShowPetWindow();
             }
+            UpdateTrayDescription();
+        }
+
+        public void ShowFromExternalRequest()
+        {
+            if (_isExiting)
+            {
+                return;
+            }
+
+            EnsurePetIsVisible();
+            ShowMessage(
+                "我在这里呀~",
+                1800,
+                _clock.ElapsedMilliseconds);
+            InvalidateVisual();
+        }
+
+        private void PrepareManualShow()
+        {
+            bool wasFullscreenHidden = _fullscreenSuppressed;
+            _userHidden = false;
+            _fullscreenSuppressed = false;
+            _fullscreenEnterSamples = 0;
+            _fullscreenExitSamples = 0;
+
+            if (_autoHideFullscreen &&
+                (wasFullscreenHidden ||
+                 _lastFullscreenSample ==
+                    FullscreenSample.FullscreenOnPetMonitor))
+            {
+                _fullscreenBypassUntilExit = true;
+                _bypassedFullscreenWindow =
+                    _lastFullscreenWindow;
+                _fullscreenBypassEarliestResetAt =
+                    _clock.ElapsedMilliseconds + 5000L;
+            }
+        }
+
+        private void ShowPetWindow()
+        {
+            if (!IsVisible)
+            {
+                Show();
+            }
+            EnsureVisibleOnAnyScreen();
         }
 
         private void ShowGreeting()
@@ -2255,13 +3399,9 @@ namespace NuoMiDesktopPet
 
         private void EnsurePetIsVisible()
         {
-            if (!IsVisible)
-            {
-                Show();
-                EnsureVisibleOnAnyScreen();
-            }
-
-            Activate();
+            PrepareManualShow();
+            ShowPetWindow();
+            UpdateTrayDescription();
         }
 
         private bool StartBehavior(CatBehavior behavior, bool userRequested)
@@ -2269,15 +3409,30 @@ namespace NuoMiDesktopPet
             long now = _clock.ElapsedMilliseconds;
             long duration = GetBehaviorDuration(behavior);
             int priority = userRequested ? 90 : GetBehaviorPriority(behavior);
+            bool replacingBehavior = _behavior.IsBusy;
+            bool continuingPoseRecovery =
+                !replacingBehavior &&
+                _poseRecoveryActive;
+            CatBehavior replacedBehavior = _behavior.Current;
+            PetPose interruptedPose = new PetPose();
+            if (replacingBehavior ||
+                continuingPoseRecovery)
+            {
+                interruptedPose = BuildPose(
+                    now / 1000.0,
+                    now);
+            }
             if (!_behavior.Start(behavior, now, duration, priority))
             {
                 return false;
             }
 
             _poseRecoveryActive = false;
+            _behaviorInputConflictStartedAt = -1L;
             _behaviorCueShown = false;
             _behaviorWasUserRequested = userRequested;
             _hasAutoWindowPosition = false;
+            _hasBehaviorHomePosition = false;
 
             NativeRect windowRect;
             if (TryGetPetWindowRect(out windowRect))
@@ -2285,16 +3440,32 @@ namespace NuoMiDesktopPet
                 _autoWindowX = windowRect.Left;
                 _autoWindowY = windowRect.Top;
                 _hasAutoWindowPosition = true;
+                _behaviorHomeX = windowRect.Left;
+                _behaviorHomeY = windowRect.Top;
+                _hasBehaviorHomePosition = true;
                 _behaviorOnRight = Forms.Cursor.Position.X >=
                     windowRect.Left + (windowRect.Right - windowRect.Left) / 2;
             }
 
             PrepareBehaviorVisuals(behavior);
 
-            if (userRequested || !_bongoMode)
+            if (replacingBehavior ||
+                continuingPoseRecovery)
+            {
+                BeginPoseRecovery(
+                    interruptedPose,
+                    now,
+                    replacedBehavior);
+            }
+
+            if (userRequested ||
+                behavior == CatBehavior.Begging)
             {
                 switch (behavior)
                 {
+                    case CatBehavior.Pounce:
+                        ShowMessage("要抓到你啦！", 1300, now);
+                        break;
                     case CatBehavior.Begging:
                         ShowMessage("主人，我饿啦…", 3000, now);
                         break;
@@ -2327,6 +3498,25 @@ namespace NuoMiDesktopPet
 
             InvalidateVisual();
             return true;
+        }
+
+        private static bool IsNoticeableAutonomousBehavior(
+            CatBehavior behavior)
+        {
+            switch (behavior)
+            {
+                case CatBehavior.Pounce:
+                case CatBehavior.CupPush:
+                case CatBehavior.Begging:
+                case CatBehavior.Grooming:
+                case CatBehavior.Stretching:
+                case CatBehavior.Sleeping:
+                case CatBehavior.Zoomies:
+                case CatBehavior.Playing:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private static long GetBehaviorDuration(CatBehavior behavior)
@@ -2379,7 +3569,9 @@ namespace NuoMiDesktopPet
                 case CatBehavior.Purring:
                     return 35;
                 case CatBehavior.Sleeping:
-                    return 30;
+                    return _behavior.Energy <= 16.0
+                        ? 80
+                        : 30;
                 case CatBehavior.Grooming:
                 case CatBehavior.Stretching:
                     return 25;
@@ -2392,13 +3584,49 @@ namespace NuoMiDesktopPet
         {
             EnsurePetIsVisible();
             _behavior.AdvanceNeeds(DateTime.UtcNow, IsVisible);
+            double fullness =
+                100.0 -
+                _behavior.Hunger;
             string status =
-                "饱腹度  " + FormatNeed(100.0 - _behavior.Hunger) + "\n" +
-                "活力值  " + FormatNeed(_behavior.Energy) + "\n" +
-                "心情值  " + FormatNeed(_behavior.Mood) + "\n" +
-                "亲密度  " + FormatNeed(_behavior.Affection) + "\n" +
-                "无聊度  " + FormatNeed(_behavior.Boredom) + "\n\n" +
-                "现在：" + GetBehaviorName(_behavior.Current);
+                "现在：" +
+                GetBehaviorName(
+                    _behavior.Current) +
+                "\n\n" +
+                "肚子：" +
+                DescribeFullness(fullness) +
+                "（" +
+                FormatNeed(fullness) +
+                "）\n" +
+                "精神：" +
+                DescribeEnergy(
+                    _behavior.Energy) +
+                "（" +
+                FormatNeed(
+                    _behavior.Energy) +
+                "）\n" +
+                "心情：" +
+                DescribeMood(
+                    _behavior.Mood) +
+                "（" +
+                FormatNeed(
+                    _behavior.Mood) +
+                "）\n" +
+                "关系：" +
+                DescribeAffection(
+                    _behavior.Affection) +
+                "（" +
+                FormatNeed(
+                    _behavior.Affection) +
+                "）\n" +
+                "玩心：" +
+                DescribeBoredom(
+                    _behavior.Boredom) +
+                "（" +
+                FormatNeed(
+                    _behavior.Boredom) +
+                "）\n\n" +
+                "小建议：" +
+                GetPetSuggestion();
 
             System.Windows.MessageBox.Show(
                 this,
@@ -2412,6 +3640,100 @@ namespace NuoMiDesktopPet
         {
             int rounded = (int)Math.Round(Clamp(value, 0.0, 100.0));
             return rounded.ToString(CultureInfo.InvariantCulture) + " / 100";
+        }
+
+        private static string DescribeFullness(double value)
+        {
+            if (value < 22.0)
+            {
+                return "饿得在找你";
+            }
+            if (value < 45.0)
+            {
+                return "有点饿";
+            }
+            if (value < 78.0)
+            {
+                return "刚刚好";
+            }
+            return "吃得很满足";
+        }
+
+        private static string DescribeEnergy(double value)
+        {
+            if (value < 20.0)
+            {
+                return "困得睁不开眼";
+            }
+            if (value < 45.0)
+            {
+                return "想休息一下";
+            }
+            if (value < 78.0)
+            {
+                return "精神不错";
+            }
+            return "精力满满";
+        }
+
+        private static string DescribeMood(double value)
+        {
+            if (value < 30.0)
+            {
+                return "需要一点陪伴";
+            }
+            if (value < 65.0)
+            {
+                return "很平静";
+            }
+            return "心情很好";
+        }
+
+        private static string DescribeAffection(double value)
+        {
+            if (value < 35.0)
+            {
+                return "正在慢慢熟悉你";
+            }
+            if (value < 70.0)
+            {
+                return "已经很信任你";
+            }
+            return "最喜欢你啦";
+        }
+
+        private static string DescribeBoredom(double value)
+        {
+            if (value < 30.0)
+            {
+                return "安静陪着你";
+            }
+            if (value < 65.0)
+            {
+                return "想活动一下";
+            }
+            return "很想和你玩";
+        }
+
+        private string GetPetSuggestion()
+        {
+            if (_behavior.Hunger >= 78.0)
+            {
+                return "给我一条小鱼干吧。";
+            }
+            if (_behavior.Energy <= 24.0)
+            {
+                return "让我安静睡一会儿吧。";
+            }
+            if (_behavior.Boredom >= 68.0)
+            {
+                return "逗我玩毛线球会很开心。";
+            }
+            if (_behavior.Mood <= 38.0)
+            {
+                return "摸摸头，我会开心一点。";
+            }
+            return "现在状态很好，陪着你就很开心。";
         }
 
         private static string GetBehaviorName(CatBehavior behavior)
@@ -2445,27 +3767,34 @@ namespace NuoMiDesktopPet
             }
         }
 
+        private void ShowHelp()
+        {
+            System.Windows.MessageBox.Show(
+                this,
+                "快速上手\n\n" +
+                "• 单击头或身体可以摸摸，碰尾巴会有不同反应\n" +
+                "• 双击糯米，它会向你打招呼\n" +
+                "• 按住糯米拖动，可以把它搬到喜欢的位置\n" +
+                "• 右键糯米，可以互动、调整大小和修改设置\n" +
+                "• 隐藏后，双击右下角托盘图标可以把它叫回来\n" +
+                "• 找不到时，再次打开 EXE 也会自动叫回糯米\n" +
+                "• 想彻底关闭，请选择红色的“退出程序（停止运行）”",
+                "糯米使用帮助",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+
         private void ShowAbout()
         {
             System.Windows.MessageBox.Show(
                 this,
-                "糯米桌面宠物 3.0\n\n" +
-                "• 拖拽宠物可移动到任意位置\n" +
-                "• 单击头或身体可以摸它，碰尾巴会有不同反应\n" +
-                "• 双击会收到一句小回应\n" +
-                "• 右键可以喂食、玩毛线球或放杯子\n" +
-                "• 糯米会自主观察、扑鼠标、讨食、梳毛和睡觉\n" +
-                "• Bongo 模式会用一只爪操作鼠标，另一只爪准确寻找键位\n" +
-                "• 空格键和鼠标掌心端靠近糯米，线缆与按键前端朝向屏幕下方\n" +
-                "• 键帽文字从糯米方向可读，设备按真实使用姿势摆放\n" +
-                "• 按键和鼠标有落爪、压下、长按、回弹与收势\n" +
-                "• 左右键以小猫面对你的视角显示，避免方向颠倒\n" +
-                "• 停止输入后，它仍会有安静的观察和小动作\n" +
-                "• “动作活泼程度”可选择轻柔、自然或活泼\n" +
+                "糯米桌面宠物 3.3\n\n" +
+                "一只会根据键盘鼠标互动，也会自己生活的橘猫桌宠。\n\n" +
+                "• 单文件 EXE，免安装、可离线运行\n" +
+                "• 支持多显示器、高 DPI、高刷新率与全屏自动隐藏\n" +
                 "• 键鼠互动只读取瞬时状态，不记录、保存或上传输入内容\n" +
-                "• 右键可设置开机自启、大小、空闲玩耍和后台运行\n" +
-                "• 双击托盘图标可显示或隐藏宠物\n\n" +
-                "所有素材都内置在单个 EXE 中，无需额外安装。",
+                "• 位置、设置和宠物状态只保存在当前 Windows 用户本机\n\n" +
+                "所有角色素材和程序资源都内置在 EXE 中。",
                 "关于糯米",
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);
@@ -2509,6 +3838,24 @@ namespace NuoMiDesktopPet
 
             UpdateCursorTelemetry(now);
             UpdateBongoInputAnimation(now, motionDelta);
+            double engagement = _interactionMotion.Engagement;
+            _breathPhase = AdvancePhase(
+                _breathPhase,
+                motionDelta *
+                    (2.03 + engagement * 0.28));
+            _tailEngagementEnvelope = Smooth(
+                _tailEngagementEnvelope,
+                engagement,
+                engagement >
+                    _tailEngagementEnvelope
+                        ? 0.035
+                        : 0.018,
+                motionDelta);
+            _tailSwayPhase = AdvancePhase(
+                _tailSwayPhase,
+                motionDelta *
+                    (0.58 +
+                     _tailEngagementEnvelope * 0.34));
             if (!_isDragging || now - _lastDragMotionAt > 65L)
             {
                 _dragLeanTarget = 0.0;
@@ -3033,12 +4380,37 @@ namespace NuoMiDesktopPet
 
             switch (_behavior.Current)
             {
+                case CatBehavior.Pounce:
                 case CatBehavior.CupPush:
                 case CatBehavior.Eating:
+                case CatBehavior.Begging:
+                case CatBehavior.Grooming:
+                case CatBehavior.Stretching:
+                case CatBehavior.Sleeping:
+                case CatBehavior.Zoomies:
                 case CatBehavior.Playing:
                     return false;
                 default:
                     return true;
+            }
+        }
+
+        private static bool IsBehaviorConflictingWithBongo(
+            CatBehavior behavior)
+        {
+            switch (behavior)
+            {
+                case CatBehavior.Pounce:
+                case CatBehavior.CupPush:
+                case CatBehavior.Begging:
+                case CatBehavior.Grooming:
+                case CatBehavior.Stretching:
+                case CatBehavior.Sleeping:
+                case CatBehavior.Zoomies:
+                case CatBehavior.Playing:
+                    return true;
+                default:
+                    return false;
             }
         }
 
@@ -3086,31 +4458,89 @@ namespace NuoMiDesktopPet
                 return;
             }
 
+            if (_behavior.IsBusy &&
+                _bongoMode &&
+                _behavior.Priority < 80 &&
+                IsBehaviorConflictingWithBongo(_behavior.Current))
+            {
+                if (IsBongoInputActive(now))
+                {
+                    if (_behaviorInputConflictStartedAt < 0L)
+                    {
+                        _behaviorInputConflictStartedAt = now;
+                    }
+                    else if (
+                        now - _behaviorInputConflictStartedAt >= 1300L)
+                    {
+                        CancelBehavior(now);
+                        return;
+                    }
+                }
+                else
+                {
+                    _behaviorInputConflictStartedAt = -1L;
+                }
+            }
+            else
+            {
+                _behaviorInputConflictStartedAt = -1L;
+            }
+
             if (_behavior.IsBusy && now >= _behavior.Until)
             {
                 CatBehavior completed = _behavior.Current;
                 _behavior.Complete(now);
                 FinishBehaviorVisuals(completed, now);
-                _behavior.ScheduleNext(
+                _behaviorInputConflictStartedAt = -1L;
+                ScheduleNextAutonomous(
                     now,
-                    _bongoMode ? 11000 : 14000,
-                    _bongoMode ? 28000 : 36000);
+                    20000,
+                    45000);
             }
 
             if (!_behavior.IsBusy &&
                 _autoInteraction &&
                 _behavior.CanAutoStart(now) &&
-                (!_bongoMode ||
-                 (!IsBongoInputActive(now) &&
-                  now - _lastBongoInputAt >= 4200L)) &&
-                (_petMenu == null || !_petMenu.IsOpen))
+                (_petMenu == null || !_petMenu.IsOpen) &&
+                (_trayMenu == null || !_trayMenu.Visible))
             {
                 CatBehavior choice;
-                if (_bongoMode)
+                CatBehavior urgentChoice;
+                bool hasUrgentNeed =
+                    _behavior.TryChooseUrgent(
+                        now,
+                        out urgentChoice);
+                bool inputActive =
+                    IsBongoInputActive(now);
+                long inputIdleFor =
+                    _lastBongoInputAt <= 0L
+                        ? Int64.MaxValue
+                        : Math.Max(
+                            0L,
+                            now -
+                            _lastBongoInputAt);
+                long fullBehaviorIdleRequired =
+                    GetFullBehaviorIdleThreshold();
+                long needIdleRequired =
+                    GetNeedIdleThreshold();
+                bool readyForFullBehavior =
+                    !_bongoMode ||
+                    (!inputActive &&
+                     inputIdleFor >=
+                        fullBehaviorIdleRequired);
+                bool readyForUrgentNeed =
+                    !_bongoMode ||
+                    (!inputActive &&
+                     inputIdleFor >=
+                        needIdleRequired);
+                if (hasUrgentNeed &&
+                    readyForUrgentNeed)
                 {
-                    choice = _behavior.ChooseDeskIdle(now);
+                    choice = urgentChoice;
                 }
-                else
+                else if (
+                    !hasUrgentNeed &&
+                    readyForFullBehavior)
                 {
                     bool cursorNear = IsCursorNearPet(900.0);
                     choice = _behavior.ChooseAutonomous(
@@ -3118,12 +4548,16 @@ namespace NuoMiDesktopPet
                         _cursorSpeed,
                         cursorNear);
                 }
+                else
+                {
+                    choice = _behavior.ChooseDeskIdle(now);
+                }
                 if (choice == CatBehavior.Idle)
                 {
-                    _behavior.ScheduleNext(
+                    ScheduleNextAutonomous(
                         now,
-                        _bongoMode ? 8000 : 6000,
-                        _bongoMode ? 18000 : 14000);
+                        8000,
+                        15000);
                 }
                 else
                 {
@@ -3140,7 +4574,20 @@ namespace NuoMiDesktopPet
             switch (_behavior.Current)
             {
                 case CatBehavior.Pounce:
-                    UpdatePounceBehavior(progress, deltaSeconds, now);
+                    if (progress >= 0.76 &&
+                        !_behaviorWasUserRequested)
+                    {
+                        ReturnPetToBehaviorHome(
+                            1450.0,
+                            deltaSeconds);
+                    }
+                    else
+                    {
+                        UpdatePounceBehavior(
+                            progress,
+                            deltaSeconds,
+                            now);
+                    }
                     break;
                 case CatBehavior.CupPush:
                     UpdateCupBehavior(progress, now);
@@ -3149,6 +4596,14 @@ namespace NuoMiDesktopPet
                     if (progress < 0.58)
                     {
                         MovePetTowardCursor(470.0, deltaSeconds);
+                    }
+                    else if (
+                        progress >= 0.74 &&
+                        !_behaviorWasUserRequested)
+                    {
+                        ReturnPetToBehaviorHome(
+                            980.0,
+                            deltaSeconds);
                     }
                     break;
                 case CatBehavior.Eating:
@@ -3161,11 +4616,82 @@ namespace NuoMiDesktopPet
                     }
                     break;
                 case CatBehavior.Zoomies:
-                    UpdateZoomiesBehavior(progress, deltaSeconds);
+                    if (progress >= 0.78 &&
+                        !_behaviorWasUserRequested)
+                    {
+                        ReturnPetToBehaviorHome(
+                            1800.0,
+                            deltaSeconds);
+                    }
+                    else
+                    {
+                        UpdateZoomiesBehavior(
+                            progress,
+                            deltaSeconds);
+                    }
                     break;
                 case CatBehavior.Playing:
                     UpdateToyBehavior(progress, now);
                     break;
+            }
+        }
+
+        private void ScheduleNextAutonomous(
+            long now,
+            int minimumDelay,
+            int maximumDelay)
+        {
+            double intervalScale;
+            switch (_interactionMotion.Personality)
+            {
+                case MotionPersonality.Quiet:
+                    intervalScale = 1.25;
+                    break;
+                case MotionPersonality.Playful:
+                    intervalScale = 0.78;
+                    break;
+                default:
+                    intervalScale = 1.0;
+                    break;
+            }
+
+            _behavior.ScheduleNext(
+                now,
+                Math.Max(
+                    500,
+                    (int)Math.Round(
+                        minimumDelay *
+                        intervalScale)),
+                Math.Max(
+                    700,
+                    (int)Math.Round(
+                        maximumDelay *
+                        intervalScale)));
+        }
+
+        private long GetFullBehaviorIdleThreshold()
+        {
+            switch (_interactionMotion.Personality)
+            {
+                case MotionPersonality.Quiet:
+                    return 45000L;
+                case MotionPersonality.Playful:
+                    return 10000L;
+                default:
+                    return 22000L;
+            }
+        }
+
+        private long GetNeedIdleThreshold()
+        {
+            switch (_interactionMotion.Personality)
+            {
+                case MotionPersonality.Quiet:
+                    return 12000L;
+                case MotionPersonality.Playful:
+                    return 7000L;
+                default:
+                    return 9000L;
             }
         }
 
@@ -3177,7 +4703,13 @@ namespace NuoMiDesktopPet
             }
             else if (!_behaviorCueShown)
             {
-                ShowMessage("啪！抓到你啦", 1150, now);
+                if (_behaviorWasUserRequested)
+                {
+                    ShowMessage(
+                        "啪！抓到你啦",
+                        1150,
+                        now);
+                }
                 _behaviorCueShown = true;
             }
         }
@@ -3202,17 +4734,19 @@ namespace NuoMiDesktopPet
                     (68.0 * push + 10.0 * touch);
                 _activeProp.MoveToPixels(
                     ClampInteger(
-                        _propOriginX +
-                        (int)Math.Round(
-                            _propDirection *
-                            (44.0 * push + 8.0 * touch)),
+                            _propOriginX +
+                            (int)Math.Round(
+                                _propDirection *
+                                (44.0 * push + 8.0 * touch) *
+                                _propPixelScaleX),
                         _propMinimumX,
                         _propMaximumX),
                     ClampInteger(
-                        _propOriginY +
-                        (int)Math.Round(
-                            7.0 * push -
-                            3.0 * touch),
+                            _propOriginY +
+                            (int)Math.Round(
+                                (7.0 * push -
+                                 3.0 * touch) *
+                                _propPixelScaleY),
                         _propMinimumY,
                         _propMaximumY));
             }
@@ -3225,7 +4759,13 @@ namespace NuoMiDesktopPet
 
             if (progress >= 0.54 && !_behaviorCueShown)
             {
-                ShowMessage("啪嗒！", 1100, now);
+                if (_behaviorWasUserRequested)
+                {
+                    ShowMessage(
+                        "啪嗒！",
+                        1100,
+                        now);
+                }
                 _behaviorCueShown = true;
             }
         }
@@ -3243,10 +4783,14 @@ namespace NuoMiDesktopPet
                 _propDirection *
                 (progress * 54.0 +
                  wave * 12.0 +
-                 touch * 17.0));
+                 touch * 17.0) *
+                _propPixelScaleX);
             int bounce = (int)Math.Round(
-                -Math.Abs(Math.Sin(progress * Math.PI * 7.0)) * 9.0 -
-                touch * 7.0);
+                (-Math.Abs(
+                    Math.Sin(progress * Math.PI * 7.0)) *
+                    9.0 -
+                 touch * 7.0) *
+                _propPixelScaleY);
             try
             {
                 _activeProp.ActionProgress =
@@ -3273,7 +4817,13 @@ namespace NuoMiDesktopPet
 
             if (progress >= 0.58 && !_behaviorCueShown)
             {
-                ShowMessage("抓住毛线球！", 1250, now);
+                if (_behaviorWasUserRequested)
+                {
+                    ShowMessage(
+                        "抓住毛线球！",
+                        1250,
+                        now);
+                }
                 _behaviorCueShown = true;
             }
         }
@@ -3300,7 +4850,7 @@ namespace NuoMiDesktopPet
                 targetLeft,
                 targetTop,
                 workArea,
-                1450.0,
+                1450.0 * GetPetPixelScale(rect),
                 deltaSeconds);
         }
 
@@ -3327,8 +4877,128 @@ namespace NuoMiDesktopPet
                 targetLeft,
                 targetTop,
                 workArea,
-                speedPixelsPerSecond,
+                speedPixelsPerSecond *
+                    GetPetPixelScale(rect),
                 deltaSeconds);
+        }
+
+        private void ReturnPetToBehaviorHome(
+            double speedPixelsPerSecond,
+            double deltaSeconds)
+        {
+            if (!_hasBehaviorHomePosition)
+            {
+                return;
+            }
+
+            NativeRect rect;
+            if (!TryGetPetWindowRect(out rect))
+            {
+                return;
+            }
+
+            int width =
+                Math.Max(
+                    1,
+                    rect.Right - rect.Left);
+            int height =
+                Math.Max(
+                    1,
+                    rect.Bottom - rect.Top);
+            Drawing.Rectangle workArea =
+                FindNearestWorkArea(
+                    (int)Math.Round(
+                        _behaviorHomeX) +
+                        width / 2,
+                    (int)Math.Round(
+                        _behaviorHomeY) +
+                        height / 2);
+            MovePetWindowToward(
+                _behaviorHomeX,
+                _behaviorHomeY,
+                workArea,
+                speedPixelsPerSecond *
+                    GetPetPixelScale(rect),
+                deltaSeconds);
+        }
+
+        private void RestoreBehaviorHomePosition(
+            CatBehavior behavior,
+            bool shouldRestore)
+        {
+            if (!shouldRestore ||
+                !_hasBehaviorHomePosition ||
+                !IsWindowMovingBehavior(behavior))
+            {
+                return;
+            }
+
+            NativeRect rect;
+            IntPtr windowHandle =
+                new WindowInteropHelper(this).Handle;
+            if (windowHandle == IntPtr.Zero ||
+                !TryGetPetWindowRect(out rect))
+            {
+                return;
+            }
+
+            int width =
+                Math.Max(
+                    1,
+                    rect.Right - rect.Left);
+            int height =
+                Math.Max(
+                    1,
+                    rect.Bottom - rect.Top);
+            Drawing.Rectangle workArea =
+                FindNearestWorkArea(
+                    (int)Math.Round(
+                        _behaviorHomeX) +
+                        width / 2,
+                    (int)Math.Round(
+                        _behaviorHomeY) +
+                        height / 2);
+            int targetLeft =
+                ClampInteger(
+                    (int)Math.Round(
+                        _behaviorHomeX),
+                    workArea.Left,
+                    Math.Max(
+                        workArea.Left,
+                        workArea.Right - width));
+            int targetTop =
+                ClampInteger(
+                    (int)Math.Round(
+                        _behaviorHomeY),
+                    workArea.Top,
+                    Math.Max(
+                        workArea.Top,
+                        workArea.Bottom - height));
+            SetWindowPos(
+                windowHandle,
+                IntPtr.Zero,
+                targetLeft,
+                targetTop,
+                0,
+                0,
+                SetWindowPosNoSize |
+                SetWindowPosNoZOrder |
+                SetWindowPosNoActivate);
+        }
+
+        private static bool IsWindowMovingBehavior(
+            CatBehavior behavior)
+        {
+            return
+                behavior == CatBehavior.Pounce ||
+                behavior == CatBehavior.Begging ||
+                behavior == CatBehavior.Zoomies;
+        }
+
+        private static double GetPetPixelScale(NativeRect rect)
+        {
+            int width = Math.Max(1, rect.Right - rect.Left);
+            return Math.Max(0.1, width / BaseWidth);
         }
 
         private void MovePetWindowToward(
@@ -3468,8 +5138,21 @@ namespace NuoMiDesktopPet
         {
             rect = new NativeRect();
             IntPtr windowHandle = new WindowInteropHelper(this).Handle;
-            return windowHandle != IntPtr.Zero &&
-                   GetWindowRect(windowHandle, out rect);
+            if (windowHandle == IntPtr.Zero ||
+                !GetWindowRect(windowHandle, out rect) ||
+                rect.Right <= rect.Left ||
+                rect.Bottom <= rect.Top)
+            {
+                return false;
+            }
+
+            _lastPetPixelBounds = Drawing.Rectangle.FromLTRB(
+                rect.Left,
+                rect.Top,
+                rect.Right,
+                rect.Bottom);
+            _hasLastPetPixelBounds = true;
+            return true;
         }
 
         private static double SmoothStep(double value)
@@ -3500,10 +5183,11 @@ namespace NuoMiDesktopPet
             CloseActiveProp();
             _hasAutoWindowPosition = false;
             _behaviorCueShown = false;
-            SavePosition();
+            RestoreBehaviorHomePosition(
+                completed,
+                !_behaviorWasUserRequested);
             bool shouldSpeak =
-                _behaviorWasUserRequested ||
-                !_bongoMode;
+                _behaviorWasUserRequested;
 
             switch (completed)
             {
@@ -3535,6 +5219,7 @@ namespace NuoMiDesktopPet
                     break;
             }
             _behaviorWasUserRequested = false;
+            _hasBehaviorHomePosition = false;
         }
 
         private void CancelBehavior(long now)
@@ -3550,32 +5235,52 @@ namespace NuoMiDesktopPet
             _behavior.Cancel(now);
             if (wasBusy)
             {
-                _poseRecoveryActive = false;
-                PetPose targetPose = BuildPose(now / 1000.0, now);
-                _poseRecoveryDelta = CreateRecoveryDelta(
+                BeginPoseRecovery(
                     interruptedPose,
-                    targetPose);
-                _poseRecoveryStartedAt = now;
-                _poseRecoveryUntil =
-                    now +
-                    (interruptedBehavior == CatBehavior.Sleeping
-                        ? 260
-                        : 190);
-                _poseRecoveryActive = true;
+                    now,
+                    interruptedBehavior);
             }
-            FadeAndCloseActiveProp(180);
+            FadeAndCloseActiveProp(220);
             _hasAutoWindowPosition = false;
+            _hasBehaviorHomePosition = false;
             _behaviorCueShown = false;
             _behaviorWasUserRequested = false;
+            _behaviorInputConflictStartedAt = -1L;
             _blinkAmount = 0.0;
             _nextBlinkAt = now + 900;
             if (_autoInteraction)
             {
-                _behavior.ScheduleNext(
+                ScheduleNextAutonomous(
                     now,
-                    _bongoMode ? 10000 : 12000,
-                    _bongoMode ? 24000 : 30000);
+                    10000,
+                    18000);
             }
+        }
+
+        private void BeginPoseRecovery(
+            PetPose interruptedPose,
+            long now,
+            CatBehavior interruptedBehavior)
+        {
+            _poseRecoveryActive = false;
+            PetPose targetPose = BuildPose(
+                now / 1000.0,
+                now);
+            _poseRecoveryDelta = CreateRecoveryDelta(
+                interruptedPose,
+                targetPose);
+            _poseRecoveryStartedAt = now;
+            _poseRecoveryUntil =
+                now +
+                (interruptedBehavior == CatBehavior.Sleeping
+                    ? 320L
+                    : 230L);
+            _tailRecoveryUntil =
+                now +
+                (interruptedBehavior == CatBehavior.Sleeping
+                    ? 900L
+                    : 680L);
+            _poseRecoveryActive = true;
         }
 
         private void ShowPropNearCat(PropKind kind)
@@ -3586,7 +5291,7 @@ namespace NuoMiDesktopPet
                 return;
             }
 
-            PropWindow prop = new PropWindow(kind);
+            PropWindow prop = new PropWindow(kind, _userScale);
             prop.Topmost = Topmost;
             prop.WindowStartupLocation = WindowStartupLocation.Manual;
             prop.Left = -10000;
@@ -3607,16 +5312,51 @@ namespace NuoMiDesktopPet
                     catRect.Bottom);
                 Drawing.Rectangle workArea = Forms.Screen.FromRectangle(catBounds).WorkingArea;
 
+                // Move the new HWND onto the cat's monitor before measuring
+                // it. Per-monitor DPI can resize a WPF window during this
+                // move, so all placement math below must use the second,
+                // monitor-correct measurement.
+                int probeWidth = Math.Max(1, propBounds.Width);
+                int probeHeight = Math.Max(1, propBounds.Height);
+                int probeX = ClampInteger(
+                    catRect.Left,
+                    workArea.Left,
+                    Math.Max(
+                        workArea.Left,
+                        workArea.Right - probeWidth));
+                int probeY = ClampInteger(
+                    catRect.Top,
+                    workArea.Top,
+                    Math.Max(
+                        workArea.Top,
+                        workArea.Bottom - probeHeight));
+                prop.MoveToPixels(probeX, probeY);
+                propBounds = prop.GetPixelBounds();
+
                 int propWidth = Math.Max(1, propBounds.Width);
                 int propHeight = Math.Max(1, propBounds.Height);
-                int rightX = catRect.Right - 18;
-                int leftX = catRect.Left - propWidth + 18;
+                _propPixelScaleX =
+                    Math.Max(0.1, propWidth / 128.0);
+                _propPixelScaleY =
+                    Math.Max(0.1, propHeight / 128.0);
+                int edgeInsetX = (int)Math.Round(
+                    18.0 * _propPixelScaleX);
+                int clearanceX = (int)Math.Round(
+                    48.0 * _propPixelScaleX);
+                int rightX = catRect.Right - edgeInsetX;
+                int leftX =
+                    catRect.Left -
+                    propWidth +
+                    edgeInsetX;
                 _propMinimumX = workArea.Left;
                 _propMaximumX = Math.Max(workArea.Left, workArea.Right - propWidth);
                 _propMinimumY = workArea.Top;
                 _propMaximumY = Math.Max(workArea.Top, workArea.Bottom - propHeight);
-                bool fitsRight = rightX + propWidth + 48 <= workArea.Right;
-                bool fitsLeft = leftX - 48 >= workArea.Left;
+                bool fitsRight =
+                    rightX + propWidth + clearanceX <=
+                    workArea.Right;
+                bool fitsLeft =
+                    leftX - clearanceX >= workArea.Left;
 
                 if (fitsRight && fitsLeft)
                 {
@@ -3633,7 +5373,11 @@ namespace NuoMiDesktopPet
 
                 _behaviorOnRight = _propDirection > 0;
                 int targetX = _propDirection > 0 ? rightX : leftX;
-                int targetY = catRect.Bottom - propHeight + 6;
+                int targetY =
+                    catRect.Bottom -
+                    propHeight +
+                    (int)Math.Round(
+                        6.0 * _propPixelScaleY);
                 targetX = ClampInteger(
                     targetX,
                     _propMinimumX,
@@ -3717,6 +5461,8 @@ namespace NuoMiDesktopPet
             _activeProp = null;
             _propTouchStrength = 0.0;
             _lastPropTouchAt = -10000L;
+            _propPixelScaleX = 1.0;
+            _propPixelScaleY = 1.0;
             if (prop == null)
             {
                 return;
@@ -3739,6 +5485,8 @@ namespace NuoMiDesktopPet
             _activeProp = null;
             _propTouchStrength = 0.0;
             _lastPropTouchAt = -10000L;
+            _propPixelScaleX = 1.0;
+            _propPixelScaleY = 1.0;
             if (prop == null)
             {
                 return;
@@ -3934,7 +5682,7 @@ namespace NuoMiDesktopPet
             PetPose pose = new PetPose();
             double engagement = _interactionMotion.Engagement;
             double breathPhase =
-                seconds * (2.03 + engagement * 0.28) +
+                _breathPhase +
                 Math.Sin(seconds * 0.23) * 0.17;
             double breath =
                 Math.Sin(breathPhase) * 0.88 +
@@ -3944,7 +5692,7 @@ namespace NuoMiDesktopPet
             double tailActivity = Lerp(
                 _interactionMotion.GetIdleTailActivity(seconds),
                 1.0,
-                engagement);
+                _tailEngagementEnvelope);
             pose.BodyOffsetY = breath * 0.58;
             pose.BodyScaleX =
                 1.0 - breath * 0.0032 +
@@ -3953,18 +5701,19 @@ namespace NuoMiDesktopPet
             pose.CharacterScaleX = 1.0;
             pose.CharacterScaleY = 1.0;
             pose.TailAngle =
-                Math.Sin(seconds * (0.82 + engagement * 0.82) + 0.3) *
-                    (1.4 + engagement * 4.5) *
+                Math.Sin(_tailSwayPhase) *
+                    (2.2 +
+                     _tailEngagementEnvelope * 3.0) *
                     tailActivity +
-                Math.Sin(seconds * 0.31 + 1.4) *
-                    0.75 *
+                Math.Sin(seconds * 0.23 + 1.4) *
+                    0.65 *
                     tailActivity +
-                _interactionMotion.TailKick * 30.0;
+                _interactionMotion.TailKick * 22.0;
             pose.TailFlex =
-                Math.Sin(seconds * (1.08 + engagement * 0.75) + 0.7) *
-                    (0.7 + engagement * 2.2) *
-                    tailActivity +
-                _interactionMotion.TailKick * 8.0;
+                pose.TailAngle * 0.23 +
+                Math.Sin(seconds * 0.42 + 0.7) *
+                    0.45 *
+                    tailActivity;
             pose.LeftPawAngle = 1.5 + weightShift * 0.55;
             pose.RightPawAngle = -1.5 - weightShift * 0.55;
             pose.CharacterAngle = weightShift * 0.22;
@@ -4033,7 +5782,9 @@ namespace NuoMiDesktopPet
                         }
                         pose.CharacterAngle = _behaviorOnRight ? 2.0 : -2.0;
                         pose.TailAngle = _behaviorOnRight ? -8.0 : 8.0;
-                        pose.TailFlex = Math.Sin(seconds * 3.0) * 1.5;
+                        pose.TailFlex =
+                            pose.TailAngle * 0.18 +
+                            Math.Sin(seconds * 1.15) * 0.55;
                         break;
 
                     case CatBehavior.Begging:
@@ -4041,32 +5792,44 @@ namespace NuoMiDesktopPet
                         pose.BodyOffsetY -= Math.Abs(cycle) * 1.8;
                         pose.LeftPawAngle = 9.0 + Math.Max(0.0, cycle) * 18.0;
                         pose.RightPawAngle = -9.0 + Math.Min(0.0, cycle) * 18.0;
-                        pose.TailAngle = Math.Sin(seconds * 2.6) * 10.0;
-                        pose.TailFlex = Math.Sin(seconds * 4.2) * 3.8;
+                        pose.TailAngle =
+                            Math.Sin(seconds * 1.25) * 8.0;
+                        pose.TailFlex =
+                            pose.TailAngle * 0.24 +
+                            Math.Sin(seconds * 0.62) * 0.65;
                         break;
 
                     case CatBehavior.Eating:
                         pose.CharacterScaleX = 1.025;
                         pose.CharacterScaleY = 0.97;
                         pose.CharacterAngle = _behaviorOnRight ? 2.5 : -2.5;
-                        pose.TailAngle = Math.Sin(seconds * 3.2) * 4.0;
-                        pose.TailFlex = Math.Sin(seconds * 2.8) * 1.8;
+                        pose.TailAngle =
+                            Math.Sin(seconds * 1.15) * 3.5;
+                        pose.TailFlex =
+                            pose.TailAngle * 0.24 +
+                            Math.Sin(seconds * 0.55) * 0.35;
                         break;
 
                     case CatBehavior.Purring:
                         pose.BodyScaleX = 1.0 - breath * 0.008;
                         pose.BodyScaleY = 1.0 + breath * 0.015;
                         pose.CharacterOffsetY = Math.Sin(seconds * 2.15) * 0.8;
-                        pose.TailAngle = Math.Sin(seconds * 1.25) * 8.0;
-                        pose.TailFlex = Math.Sin(seconds * 1.9) * 3.0;
+                        pose.TailAngle =
+                            Math.Sin(seconds * 0.95) * 7.0;
+                        pose.TailFlex =
+                            pose.TailAngle * 0.25 +
+                            Math.Sin(seconds * 0.46) * 0.45;
                         break;
 
                     case CatBehavior.Grooming:
                         action = 0.5 + 0.5 * Math.Sin(seconds * 5.8);
                         pose.LeftPawAngle = -145.0 - action * 23.0;
                         pose.CharacterAngle = 2.0;
-                        pose.TailAngle = Math.Sin(seconds * 1.1) * 3.0;
-                        pose.TailFlex = Math.Sin(seconds * 1.4) * 1.2;
+                        pose.TailAngle =
+                            Math.Sin(seconds * 0.86) * 3.0;
+                        pose.TailFlex =
+                            pose.TailAngle * 0.22 +
+                            Math.Sin(seconds * 0.40) * 0.28;
                         break;
 
                     case CatBehavior.Stretching:
@@ -4111,8 +5874,11 @@ namespace NuoMiDesktopPet
                             pose.LeftPawAngle = 18.0 + action * 58.0;
                         }
                         pose.BodyOffsetY -= Math.Abs(Math.Sin(seconds * 8.0)) * 1.5;
-                        pose.TailAngle = Math.Sin(seconds * 4.0) * 12.0;
-                        pose.TailFlex = Math.Sin(seconds * 5.2) * 4.5;
+                        pose.TailAngle =
+                            Math.Sin(seconds * 1.85) * 10.0;
+                        pose.TailFlex =
+                            pose.TailAngle * 0.24 +
+                            Math.Sin(seconds * 1.05) * 0.70;
                         break;
                 }
 
@@ -4265,24 +6031,49 @@ namespace NuoMiDesktopPet
 
             if (_poseRecoveryActive)
             {
-                if (now >= _poseRecoveryUntil ||
-                    _poseRecoveryUntil <= _poseRecoveryStartedAt)
+                if (now >= _tailRecoveryUntil ||
+                    _tailRecoveryUntil <= _poseRecoveryStartedAt)
                 {
                     _poseRecoveryActive = false;
                 }
                 else
                 {
-                    double recoveryProgress =
+                    double bodyRecoveryWeight = 0.0;
+                    if (now < _poseRecoveryUntil &&
+                        _poseRecoveryUntil >
+                            _poseRecoveryStartedAt)
+                    {
+                        double recoveryProgress =
+                            (now - _poseRecoveryStartedAt) /
+                            (double)(
+                                _poseRecoveryUntil -
+                                _poseRecoveryStartedAt);
+                        bodyRecoveryWeight =
+                            1.0 -
+                            SmoothStep(
+                                Clamp(
+                                    recoveryProgress,
+                                    0.0,
+                                    1.0));
+                    }
+
+                    double tailRecoveryProgress =
                         (now - _poseRecoveryStartedAt) /
-                        (double)(_poseRecoveryUntil - _poseRecoveryStartedAt);
-                    double recoveryWeight =
+                        (double)(
+                            _tailRecoveryUntil -
+                            _poseRecoveryStartedAt);
+                    double tailRecoveryWeight =
                         1.0 -
                         SmoothStep(
-                            Clamp(recoveryProgress, 0.0, 1.0));
+                            Clamp(
+                                tailRecoveryProgress,
+                                0.0,
+                                1.0));
                     AddRecoveryDelta(
                         ref pose,
                         _poseRecoveryDelta,
-                        recoveryWeight);
+                        bodyRecoveryWeight,
+                        tailRecoveryWeight);
                 }
             }
 
@@ -4335,23 +6126,28 @@ namespace NuoMiDesktopPet
         private static void AddRecoveryDelta(
             ref PetPose pose,
             PetPose delta,
-            double amount)
+            double bodyAmount,
+            double tailAmount)
         {
-            pose.BodyOffsetY += delta.BodyOffsetY * amount;
-            pose.BodyScaleX += delta.BodyScaleX * amount;
-            pose.BodyScaleY += delta.BodyScaleY * amount;
-            pose.TailAngle += delta.TailAngle * amount;
-            pose.TailFlex += delta.TailFlex * amount;
-            pose.LeftPawAngle += delta.LeftPawAngle * amount;
-            pose.RightPawAngle += delta.RightPawAngle * amount;
-            pose.LeftPawOffsetX += delta.LeftPawOffsetX * amount;
-            pose.LeftPawOffsetY += delta.LeftPawOffsetY * amount;
-            pose.RightPawOffsetX += delta.RightPawOffsetX * amount;
-            pose.RightPawOffsetY += delta.RightPawOffsetY * amount;
-            pose.CharacterOffsetY += delta.CharacterOffsetY * amount;
-            pose.CharacterScaleX += delta.CharacterScaleX * amount;
-            pose.CharacterScaleY += delta.CharacterScaleY * amount;
-            pose.CharacterAngle += delta.CharacterAngle * amount;
+            pose.BodyOffsetY += delta.BodyOffsetY * bodyAmount;
+            pose.BodyScaleX += delta.BodyScaleX * bodyAmount;
+            pose.BodyScaleY += delta.BodyScaleY * bodyAmount;
+            pose.TailAngle += delta.TailAngle * tailAmount;
+            pose.TailFlex += delta.TailFlex * tailAmount;
+            pose.LeftPawAngle += delta.LeftPawAngle * bodyAmount;
+            pose.RightPawAngle += delta.RightPawAngle * bodyAmount;
+            pose.LeftPawOffsetX += delta.LeftPawOffsetX * bodyAmount;
+            pose.LeftPawOffsetY += delta.LeftPawOffsetY * bodyAmount;
+            pose.RightPawOffsetX += delta.RightPawOffsetX * bodyAmount;
+            pose.RightPawOffsetY += delta.RightPawOffsetY * bodyAmount;
+            pose.CharacterOffsetY +=
+                delta.CharacterOffsetY * bodyAmount;
+            pose.CharacterScaleX +=
+                delta.CharacterScaleX * bodyAmount;
+            pose.CharacterScaleY +=
+                delta.CharacterScaleY * bodyAmount;
+            pose.CharacterAngle +=
+                delta.CharacterAngle * bodyAmount;
         }
 
         private static PetPose BlendPetPose(
@@ -5108,6 +6904,62 @@ namespace NuoMiDesktopPet
             return null;
         }
 
+        private IntPtr PetWindowProc(
+            IntPtr hwnd,
+            int message,
+            IntPtr wParam,
+            IntPtr lParam,
+            ref bool handled)
+        {
+            if (message == WmMouseActivate)
+            {
+                handled = true;
+                return new IntPtr(MaNoActivate);
+            }
+
+            if (message == WmNcHitTest &&
+                !_isDragging &&
+                !_dragPending &&
+                !IsMouseCaptured)
+            {
+                NativeRect rect;
+                if (TryGetPetWindowRect(out rect))
+                {
+                    int width =
+                        Math.Max(
+                            1,
+                            rect.Right - rect.Left);
+                    int height =
+                        Math.Max(
+                            1,
+                            rect.Bottom - rect.Top);
+                    long packed = lParam.ToInt64();
+                    int screenX =
+                        unchecked(
+                            (short)(packed & 0xFFFF));
+                    int screenY =
+                        unchecked(
+                            (short)((packed >> 16) & 0xFFFF));
+                    double x =
+                        (screenX - rect.Left) *
+                        BaseWidth /
+                        width;
+                    double y =
+                        (screenY - rect.Top) *
+                        BaseHeight /
+                        height;
+                    if (ResolvePetHitZone(x, y) ==
+                        PetHitZone.None)
+                    {
+                        handled = true;
+                        return new IntPtr(HtTransparent);
+                    }
+                }
+            }
+
+            return IntPtr.Zero;
+        }
+
         private PetHitZone GetPetHitZone(Point point)
         {
             double x = point.X * BaseWidth / Math.Max(ActualWidth, 1.0);
@@ -5194,6 +7046,10 @@ namespace NuoMiDesktopPet
         {
             PetHitZone zone = GetPetHitZone(e.GetPosition(this));
             _pointerDownZone = zone;
+            if (zone == PetHitZone.None)
+            {
+                return;
+            }
 
             if (IsBongoDeskActive() && zone == PetHitZone.BongoMouse)
             {
@@ -5450,7 +7306,16 @@ namespace NuoMiDesktopPet
                 else if (pressedZone == PetHitZone.Bubble &&
                          releaseZone == PetHitZone.Bubble)
                 {
-                    ShowGreeting();
+                    if (_behavior.IsBusy &&
+                        _behavior.Current ==
+                            CatBehavior.Begging)
+                    {
+                        FeedTheCat();
+                    }
+                    else
+                    {
+                        ShowGreeting();
+                    }
                 }
                 else if (pressedZone == PetHitZone.BongoKeyboard &&
                          releaseZone == PetHitZone.BongoKeyboard)
@@ -5553,10 +7418,48 @@ namespace NuoMiDesktopPet
 
         private void SetUserScale(double scale)
         {
-            _userScale = scale;
+            double normalizedScale = NormalizeUserScale(scale);
+            if (Math.Abs(normalizedScale - _userScale) < 0.0001)
+            {
+                RefreshMenuState();
+                RefreshTrayMenuState();
+                return;
+            }
+
+            if (_activeProp != null)
+            {
+                CloseActiveProp();
+            }
+            if (_behavior.IsBusy)
+            {
+                CancelBehavior(_clock.ElapsedMilliseconds);
+            }
+
+            _userScale = normalizedScale;
             ApplyScale(true);
             SaveSimpleSetting("Scale", _userScale.ToString(CultureInfo.InvariantCulture));
             SavePosition();
+            RefreshMenuState();
+            RefreshTrayMenuState();
+            InvalidateVisual();
+        }
+
+        private static double NormalizeUserScale(double scale)
+        {
+            if (Double.IsNaN(scale) ||
+                Double.IsInfinity(scale))
+            {
+                return 1.0;
+            }
+
+            int percentage = (int)Math.Round(
+                scale * 100.0,
+                MidpointRounding.AwayFromZero);
+            percentage = ClampInteger(
+                percentage,
+                MinimumScalePercentage,
+                MaximumScalePercentage);
+            return percentage / 100.0;
         }
 
         private void ApplyScale(bool preserveBottomCenter)
@@ -5573,7 +7476,14 @@ namespace NuoMiDesktopPet
             {
                 Left = oldCenter - Width / 2.0;
                 Top = oldBottom - Height;
-                EnsureVisibleOnAnyScreen();
+                if (IsVisible)
+                {
+                    EnsureVisibleOnAnyScreen();
+                }
+                else
+                {
+                    _needsVisibilityCorrection = true;
+                }
             }
         }
 
@@ -5595,6 +7505,7 @@ namespace NuoMiDesktopPet
 
         private void MoveToPrimaryScreen()
         {
+            PrepareManualShow();
             if (!IsVisible)
             {
                 Show();
@@ -5626,13 +7537,16 @@ namespace NuoMiDesktopPet
             }
 
             SavePosition();
+            UpdateTrayDescription();
         }
 
         private void EnsureVisibleOnAnyScreen()
         {
             if (double.IsNaN(Left) || double.IsNaN(Top))
             {
-                MoveToPrimaryScreen();
+                Rect workArea = SystemParameters.WorkArea;
+                Left = workArea.Right - Width - 26;
+                Top = workArea.Bottom - Height - 18;
                 return;
             }
 
@@ -5672,7 +7586,9 @@ namespace NuoMiDesktopPet
                 return;
             }
 
-            MoveToPrimaryScreen();
+            Rect fallbackWorkArea = SystemParameters.WorkArea;
+            Left = fallbackWorkArea.Right - Width - 26;
+            Top = fallbackWorkArea.Bottom - Height - 18;
         }
 
         private void DisplaySettingsChanged(object sender, EventArgs e)
@@ -5689,6 +7605,13 @@ namespace NuoMiDesktopPet
                     return;
                 }
 
+                _fullscreenEnterSamples = 0;
+                _fullscreenExitSamples = 0;
+                _lastFullscreenSample =
+                    FullscreenSample.Unknown;
+                _lastFullscreenWindow = IntPtr.Zero;
+                _bypassedFullscreenWindow = IntPtr.Zero;
+                _hasLastPetPixelBounds = false;
                 if (!IsVisible)
                 {
                     _needsVisibilityCorrection = true;
@@ -5714,17 +7637,29 @@ namespace NuoMiDesktopPet
                     object scaleValue = key.GetValue("Scale");
                     double parsedScale;
                     if (scaleValue != null &&
-                        double.TryParse(scaleValue.ToString(), NumberStyles.Float, CultureInfo.InvariantCulture, out parsedScale) &&
-                        parsedScale >= 0.65 &&
-                        parsedScale <= 1.50)
+                        double.TryParse(
+                            scaleValue.ToString(),
+                            NumberStyles.Float,
+                            CultureInfo.InvariantCulture,
+                            out parsedScale) &&
+                        parsedScale >=
+                            MinimumScalePercentage / 100.0 &&
+                        parsedScale <=
+                            MaximumScalePercentage / 100.0)
                     {
-                        _userScale = parsedScale;
+                        _userScale =
+                            NormalizeUserScale(parsedScale);
                     }
 
                     _followMouse = ReadInteger(key, "FollowMouse", 1) != 0;
                     Topmost = ReadInteger(key, "Topmost", 1) != 0;
                     _autoInteraction = ReadInteger(key, "AutoInteraction", 1) != 0;
                     _bongoMode = ReadInteger(key, "BongoMode", 1) != 0;
+                    _autoHideFullscreen =
+                        ReadInteger(
+                            key,
+                            "AutoHideFullscreen",
+                            1) != 0;
                     _hasShownWelcome =
                         ReadInteger(key, "HasShownWelcome", 0) != 0;
                     int savedPersonality = ReadInteger(
@@ -5740,11 +7675,12 @@ namespace NuoMiDesktopPet
             }
             catch
             {
-                _userScale = 1.0;
+                _userScale = 0.80;
                 _followMouse = true;
                 Topmost = true;
                 _autoInteraction = true;
                 _bongoMode = true;
+                _autoHideFullscreen = true;
                 _interactionMotion.Personality = MotionPersonality.Natural;
             }
         }
@@ -5900,7 +7836,7 @@ namespace NuoMiDesktopPet
             SaveSimpleSetting("Top", Top.ToString(CultureInfo.InvariantCulture));
         }
 
-        private void SaveSimpleSetting(string name, object value)
+        private bool SaveSimpleSetting(string name, object value)
         {
             try
             {
@@ -5909,13 +7845,36 @@ namespace NuoMiDesktopPet
                     if (key != null)
                     {
                         key.SetValue(name, value);
+                        return true;
                     }
                 }
             }
             catch
             {
-                // A read-only or restricted profile should not stop the pet from running.
+                // A read-only or restricted profile should not stop the pet
+                // from running.
             }
+
+            if (!_hasShownSettingsSaveError &&
+                !_isDiagnosticPreview)
+            {
+                _hasShownSettingsSaveError = true;
+                ShowMessage(
+                    "设置已生效，但暂时无法保存",
+                    3200,
+                    _clock.ElapsedMilliseconds);
+                if (_notifyIcon != null)
+                {
+                    _notifyIcon.BalloonTipTitle =
+                        "设置暂时无法保存";
+                    _notifyIcon.BalloonTipText =
+                        "本次设置已经生效，但重启后可能恢复原样。请检查当前 Windows 账户是否允许保存个人设置。";
+                    _notifyIcon.BalloonTipIcon =
+                        Forms.ToolTipIcon.Warning;
+                    _notifyIcon.ShowBalloonTip(3200);
+                }
+            }
+            return false;
         }
 
         private bool IsStartupEnabled()
@@ -5924,7 +7883,30 @@ namespace NuoMiDesktopPet
             {
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(StartupKeyPath, false))
                 {
-                    return key != null && key.GetValue(StartupValueName) != null;
+                    if (key == null)
+                    {
+                        return false;
+                    }
+
+                    object value =
+                        key.GetValue(StartupValueName);
+                    if (value == null)
+                    {
+                        return false;
+                    }
+
+                    string executablePath =
+                        Process.GetCurrentProcess()
+                            .MainModule.FileName;
+                    string expected =
+                        "\"" +
+                        Path.GetFullPath(
+                            executablePath) +
+                        "\"";
+                    return String.Equals(
+                        value.ToString().Trim(),
+                        expected,
+                        StringComparison.OrdinalIgnoreCase);
                 }
             }
             catch
@@ -5947,7 +7929,12 @@ namespace NuoMiDesktopPet
                     if (enabled)
                     {
                         string executablePath = Process.GetCurrentProcess().MainModule.FileName;
-                        key.SetValue(StartupValueName, "\"" + executablePath + "\" --autostart");
+                        key.SetValue(
+                            StartupValueName,
+                            "\"" +
+                            Path.GetFullPath(
+                                executablePath) +
+                            "\"");
                     }
                     else
                     {
@@ -6045,10 +8032,17 @@ namespace NuoMiDesktopPet
             }
             _behavior.Cancel(_clock.ElapsedMilliseconds);
             CloseActiveProp();
+            StopFullscreenMonitoring();
             StopInputMonitoring();
             DisposeInputMonitor();
             StopRendering();
+            if (_windowSource != null)
+            {
+                _windowSource.RemoveHook(PetWindowProc);
+                _windowSource = null;
+            }
             IsVisibleChanged -= PetWindowIsVisibleChanged;
+            SourceInitialized -= PetSourceInitialized;
             SystemEvents.DisplaySettingsChanged -= DisplaySettingsChanged;
 
             _notifyIcon.Visible = false;
@@ -6068,6 +8062,19 @@ namespace NuoMiDesktopPet
         private static double Clamp(double value, double minimum, double maximum)
         {
             return Math.Max(minimum, Math.Min(maximum, value));
+        }
+
+        private static double AdvancePhase(
+            double phase,
+            double amount)
+        {
+            double next = phase + amount;
+            double fullTurn = Math.PI * 2.0;
+            if (next >= fullTurn || next <= -fullTurn)
+            {
+                next %= fullTurn;
+            }
+            return next;
         }
 
         private static double Smooth(
