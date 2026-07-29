@@ -18,10 +18,15 @@ namespace NuoMiDesktopPet
 
     internal sealed class PropWindow : Window
     {
+        private const double BaseSize = 128.0;
         private const int MonitorDefaultToNearest = 2;
         private const uint SwpNoSize = 0x0001;
         private const uint SwpNoZOrder = 0x0004;
         private const uint SwpNoActivate = 0x0010;
+        private const int WmMouseActivate = 0x0021;
+        private const int WmNcHitTest = 0x0084;
+        private const int MaNoActivate = 3;
+        private const int HtTransparent = -1;
 
         private static readonly Brush ShadowOuterBrush = MakeSolidBrush(28, 87, 62, 47);
         private static readonly Brush ShadowMiddleBrush = MakeSolidBrush(45, 87, 62, 47);
@@ -80,17 +85,26 @@ namespace NuoMiDesktopPet
 
         private double _visualRotation;
         private double _actionProgress;
+        private HwndSource _windowSource;
 
-        public PropWindow(PropKind kind)
+        public PropWindow(PropKind kind, double scale)
         {
+            if (Double.IsNaN(scale) ||
+                Double.IsInfinity(scale) ||
+                scale <= 0.0)
+            {
+                scale = 1.0;
+            }
+
+            double scaledSize = BaseSize * scale;
             Kind = kind;
             Title = GetTitle(kind);
-            Width = 128.0;
-            Height = 128.0;
-            MinWidth = 128.0;
-            MinHeight = 128.0;
-            MaxWidth = 128.0;
-            MaxHeight = 128.0;
+            Width = scaledSize;
+            Height = scaledSize;
+            MinWidth = scaledSize;
+            MinHeight = scaledSize;
+            MaxWidth = scaledSize;
+            MaxHeight = scaledSize;
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
             AllowsTransparency = true;
@@ -100,8 +114,10 @@ namespace NuoMiDesktopPet
             Topmost = true;
             Focusable = false;
             Cursor = Cursors.Hand;
-            SnapsToDevicePixels = true;
-            UseLayoutRounding = true;
+            SnapsToDevicePixels = false;
+            UseLayoutRounding = false;
+            SourceInitialized += PropSourceInitialized;
+            Closed += PropClosed;
         }
 
         public PropKind Kind { get; private set; }
@@ -215,10 +231,167 @@ namespace NuoMiDesktopPet
             e.Handled = true;
         }
 
+        private void PropSourceInitialized(
+            object sender,
+            EventArgs e)
+        {
+            _windowSource =
+                HwndSource.FromHwnd(
+                    new WindowInteropHelper(this).Handle);
+            if (_windowSource != null)
+            {
+                _windowSource.AddHook(PropWindowProc);
+            }
+        }
+
+        private void PropClosed(
+            object sender,
+            EventArgs e)
+        {
+            if (_windowSource != null)
+            {
+                _windowSource.RemoveHook(PropWindowProc);
+                _windowSource = null;
+            }
+            SourceInitialized -= PropSourceInitialized;
+            Closed -= PropClosed;
+        }
+
+        private IntPtr PropWindowProc(
+            IntPtr hwnd,
+            int message,
+            IntPtr wParam,
+            IntPtr lParam,
+            ref bool handled)
+        {
+            if (message == WmMouseActivate)
+            {
+                handled = true;
+                return new IntPtr(MaNoActivate);
+            }
+
+            if (message == WmNcHitTest)
+            {
+                NativeRect bounds;
+                if (GetWindowRect(hwnd, out bounds))
+                {
+                    long packed = lParam.ToInt64();
+                    int screenX =
+                        unchecked(
+                            (short)(packed & 0xFFFF));
+                    int screenY =
+                        unchecked(
+                            (short)((packed >> 16) & 0xFFFF));
+                    int width =
+                        Math.Max(
+                            1,
+                            bounds.Right - bounds.Left);
+                    int height =
+                        Math.Max(
+                            1,
+                            bounds.Bottom - bounds.Top);
+                    double x =
+                        (screenX - bounds.Left) *
+                        BaseSize /
+                        width;
+                    double y =
+                        (screenY - bounds.Top) *
+                        BaseSize /
+                        height;
+                    if (!IsVisiblePropPoint(x, y))
+                    {
+                        handled = true;
+                        return new IntPtr(HtTransparent);
+                    }
+                }
+            }
+
+            return IntPtr.Zero;
+        }
+
+        private bool IsVisiblePropPoint(
+            double x,
+            double y)
+        {
+            switch (Kind)
+            {
+                case PropKind.Cup:
+                    return
+                        (x >= 25.0 &&
+                         x <= 94.0 &&
+                         y >= 31.0 &&
+                         y <= 116.0) ||
+                        EllipseContains(
+                            x,
+                            y,
+                            92.0,
+                            68.0,
+                            22.0,
+                            29.0);
+
+                case PropKind.FoodBowl:
+                    return
+                        x >= 14.0 &&
+                        x <= 114.0 &&
+                        y >= 38.0 &&
+                        y <= 121.0;
+
+                case PropKind.ToyBall:
+                    double bounce =
+                        18.0 *
+                        Math.Sin(
+                            _actionProgress *
+                            Math.PI);
+                    return
+                        EllipseContains(
+                            x,
+                            y,
+                            62.0,
+                            67.0 - bounce,
+                            45.0,
+                            45.0) ||
+                        (x >= 88.0 &&
+                         x <= 126.0 &&
+                         y >= 72.0 - bounce &&
+                         y <= 110.0);
+
+                default:
+                    return false;
+            }
+        }
+
+        private static bool EllipseContains(
+            double x,
+            double y,
+            double centerX,
+            double centerY,
+            double radiusX,
+            double radiusY)
+        {
+            double normalizedX =
+                (x - centerX) /
+                radiusX;
+            double normalizedY =
+                (y - centerY) /
+                radiusY;
+            return
+                normalizedX * normalizedX +
+                normalizedY * normalizedY <= 1.0;
+        }
+
         protected override void OnRender(DrawingContext drawingContext)
         {
             base.OnRender(drawingContext);
 
+            double scaleX = ActualWidth / BaseSize;
+            double scaleY = ActualHeight / BaseSize;
+            if (scaleX <= 0.0 || scaleY <= 0.0)
+            {
+                return;
+            }
+
+            drawingContext.PushTransform(
+                new ScaleTransform(scaleX, scaleY));
             switch (Kind)
             {
                 case PropKind.Cup:
@@ -231,6 +404,7 @@ namespace NuoMiDesktopPet
                     DrawToyBall(drawingContext);
                     break;
             }
+            drawingContext.Pop();
         }
 
         private void DrawCup(DrawingContext drawingContext)
